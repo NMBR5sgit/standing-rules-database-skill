@@ -89,4 +89,4 @@ Design synthesized from: the Hermes skills system (always-injected memory + on-d
 
 ---
 
-*By the author.*
+*By Lee Weaver.*

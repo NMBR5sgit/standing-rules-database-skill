@@ -1,4 +1,4 @@
-# standing-rules — a growing standing-rules database for AI agents
+# standing-rules-database-skill — a growing standing-rules database for AI agents
 
 Agents that follow standing rules usually inject every rule into every prompt. That works for ten rules and collapses at fifty: the rule set eats the context budget, and adding a rule means editing the permanent prompt. The opposite extreme — semantic search over a rules database — silently misses mandatory rules, because retrieval is probabilistic.
 

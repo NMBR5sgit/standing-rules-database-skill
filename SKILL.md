@@ -1,5 +1,5 @@
 ---
-name: standing-rules
+name: standing-rules-database-skill
 description: "Standing rule database; consult the index before any task."
 version: 1.0.0
 metadata:

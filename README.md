@@ -2,7 +2,9 @@
 
 Agents that follow standing rules usually inject every rule into every prompt. That works for ten rules and collapses at fifty: the rule set eats the context budget, and adding a rule means editing the permanent prompt. The opposite extreme — semantic search over a rules database — silently misses mandatory rules, because retrieval is probabilistic.
 
-`standing-rules` is the middle design: **a persistent rule database that grows, consulted per-task, with only the matching rules loaded into the job's context — while mandatory rules stay deterministically loaded.**
+`standing-rules-database-skill` is the middle design: **a persistent rule database that grows, consulted per-task, with only the matching rules loaded into the job's context — while mandatory rules stay deterministically loaded.**
+
+**The key property: storage and context cost are decoupled.** The number of rules is bound by *how many triggers match a given job*, not by how many rules are in the database. A 500-rule database costs the same context per job as a 30-rule one: mandatory rules (single-digit) are always loaded, each turn injects only the handful of rules whose triggers the job's wording touches, and everything else stays dormant until it's needed. Storage scales freely; attention stays cheap.
 
 ## How it works
 

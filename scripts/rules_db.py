@@ -86,13 +86,24 @@ def upsert_rule(con, r):
 
 def cmd_seed(con, path):
     data = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    rules_count = len(data.get("rules", []))
     for r in data.get("rules", []):
         upsert_rule(con, r)
+    facts_inserted = 0
+    facts_skipped = 0
     for f in data.get("facts", []):
-        con.execute("INSERT INTO facts(domain,text,created_at,updated_at) VALUES(?,?,?,?)",
-                    (f["domain"], f["text"], now(), now()))
+        exists = con.execute(
+            "SELECT 1 FROM facts WHERE domain=? AND text=?",
+            (f["domain"], f["text"])).fetchone()
+        if exists:
+            facts_skipped += 1
+        else:
+            con.execute("INSERT INTO facts(domain,text,created_at,updated_at) VALUES(?,?,?,?)",
+                        (f["domain"], f["text"], now(), now()))
+            facts_inserted += 1
     con.commit()
-    print(f"seeded {len(data.get('rules', []))} rules, {len(data.get('facts', []))} facts")
+    print(f"seeded {rules_count} rules, inserted {facts_inserted} facts, "
+          f"skipped {facts_skipped} duplicate facts")
 
 
 def cmd_add(con, a):

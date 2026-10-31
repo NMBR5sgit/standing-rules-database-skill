@@ -1,6 +1,6 @@
 ---
 name: standing-rules-database-skill
-description: "Standing rule database; consult the index before any task."
+description: "Agent standing rules database: unlimited rules, bounded context — loads only rules matching each task."
 version: 1.0.0
 metadata:
   hermes:

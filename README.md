@@ -73,6 +73,12 @@ python scripts/rules_db.py export-md
 
 Copy `SKILL.md` into your agent's skills directory (Hermes, Claude Code skills, or any agent that loads instruction files on demand), keep `templates/seed.example.json` as your starting shape, and mirror your tier-1 rules into your agent's always-injected memory.
 
+Or install it as a skill directly:
+
+```bash
+npx skills add NMBR5sgit/standing-rules-database-skill
+```
+
 ## Credits
 
 Design synthesized from: the Hermes skills system (always-injected memory + on-demand skill loading), `adeonir/agent-skills@rule-creator` (dispatch tables, write gates, rule format discipline), `akitaonrails/ai-memory` (mandatory pre-work retrieval habit, pinned-context concept), and an independent design review (two-tier retrieval, rules-vs-facts, stable IDs, status lifecycle, authority boundary, proportionality).

@@ -76,7 +76,7 @@ def connect():
     return con
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def init_db(con):
@@ -123,11 +123,12 @@ def _migrate(con):
     current = row[0] if row else 0
     if current >= SCHEMA_VERSION:
         return
-    # Future migrations go here, guarded by PRAGMA table_info checks:
-    # if current < 2:
-    #     cols = {r["name"] for r in con.execute("PRAGMA table_info(facts)")}
-    #     if "fact_key" not in cols:
-    #         con.execute("ALTER TABLE facts ADD COLUMN fact_key TEXT")
+    if current < 2:
+        cols = {r["name"] for r in con.execute("PRAGMA table_info(facts)")}
+        if "fact_key" not in cols:
+            con.execute("ALTER TABLE facts ADD COLUMN fact_key TEXT")
+        if "fact_value" not in cols:
+            con.execute("ALTER TABLE facts ADD COLUMN fact_value TEXT")
     if current == 0:
         con.execute("INSERT INTO schema_version(v) VALUES (?)", (SCHEMA_VERSION,))
     else:
@@ -163,8 +164,13 @@ def cmd_seed(con, path):
         if exists:
             facts_skipped += 1
         else:
-            con.execute("INSERT INTO facts(domain,text,created_at,updated_at) VALUES(?,?,?,?)",
-                        (f["domain"], f["text"], now(), now()))
+            key = f.get("key")
+            value = f.get("value")
+            con.execute(
+                "INSERT INTO facts(domain,text,fact_key,fact_value,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (f["domain"], f["text"], key, value, now(), now()),
+            )
             facts_inserted += 1
     con.commit()
     print(f"seeded {rules_count} rules, inserted {facts_inserted} facts, "
@@ -238,7 +244,10 @@ def cmd_facts(con, a):
     q = "SELECT * FROM facts" + (" WHERE domain=?" if a.domain else "") + " ORDER BY domain, fact_id"
     rows = con.execute(q, (a.domain,) if a.domain else ()).fetchall()
     for r in rows:
-        print(f"[{r['domain']}] {r['text']}")
+        if not a.verbose and r["fact_key"] and r["fact_value"]:
+            print(f"[{r['domain']}] {r['fact_key']}={r['fact_value']}")
+        else:
+            print(f"[{r['domain']}] {r['text']}")
 
 
 def cmd_log(con, a):
@@ -310,7 +319,7 @@ def main():
     st = sub.add_parser("status"); st.add_argument("id"); st.add_argument("state",
         choices=["active", "disabled", "deprecated"]); st.add_argument("--reason", default="")
     q = sub.add_parser("query"); q.add_argument("--match", default=""); q.add_argument("--json", action="store_true")
-    f = sub.add_parser("facts"); f.add_argument("--domain")
+    f = sub.add_parser("facts"); f.add_argument("--domain"); f.add_argument("--verbose", action="store_true")
     l = sub.add_parser("log"); l.add_argument("--task", required=True); l.add_argument("--rule-ids", required=True)
     l.add_argument("--method", default="keyword"); l.add_argument("--reason", default="")
     l.add_argument("--not-injected", action="store_true")

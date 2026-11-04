@@ -42,7 +42,17 @@ Keep one line per domain. The domains are YOURS — derived from your own system
 | `your-domain-2` | keywords for another system or output type |
 
 ## Tier 1 — HARD rules (deterministic retrieval: always-injected memory, never dependent on this skill being loaded)
-Tier-1 is YOURS — the few rules that must apply to every job no matter what, imported from your own system at bootstrap. Keep them single-digit and mirror them into your agent's always-injected memory. Shape of a tier-1 entry: `[SR-T1x] <rule text>`, e.g. a required output-format rule, or a contact-identity rule for outbound text.
+Tier-1 is YOURS — the few rules that must apply to every job, imported from your
+own system at bootstrap. Keep them single-digit; mirror them into your agent's
+always-injected memory. Write them terse — every turn pays for them:
+
+  [SR-T1x] <one imperative sentence>
+
+Form examples (not shipped rules — replace with your own):
+  [SR-T1x] Public identity = legal business name, never nickname.
+  [SR-T1x] Business contact = A@B only; never C.
+  [SR-T1x] Every response: timestamp on top.
+  [SR-T1x] Prices: check live, never from memory.
 
 ## Rule conventions
 - Stable IDs: rules are cited as [SR-xxx] so audits/conflicts can point at one rule, not a line.

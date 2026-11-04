@@ -54,15 +54,22 @@ class SchemaVersionTest(unittest.TestCase):
         self.con.execute("UPDATE schema_version SET v=0")
         self.con.commit()
         rules_db.init_db(self.con)
-        # Brief's _migrate inserts when current == 0; assert the DB reflects
-        # the current version, not a specific row count (rows>1 possible per
-        # the brief's runner; no column changes in this commit).
-        rows = self._version_rows()
-        self.assertTrue(rows)
-        self.assertTrue(any(r[0] == rules_db.SCHEMA_VERSION for r in rows))
-        # NOTE: per the brief's runner, a stale v=0 row is left in place and a
-        # new row is INSERTed (rows may be [0, 1]). _migrate re-reads LIMIT 1;
-        # flagged to owner rather than improvised around in this commit.
+        # schema_version is append-tolerant by design; rows may be [0, 2]
+        # after a stale-row scenario. The invariant is MAX(v) == SCHEMA_VERSION.
+        row = self.con.execute("SELECT MAX(v) FROM schema_version").fetchone()
+        self.assertEqual(row[0], rules_db.SCHEMA_VERSION)
+
+    def test_stale_zero_row_does_not_regress_version(self):
+        """A stale v=0 row (manual UPDATE, half-applied migration) must not
+        cause the effective version to regress on the next init_db."""
+        rules_db.init_db(self.con)
+        self.con.execute("INSERT INTO schema_version(v) VALUES (0)")
+        self.con.commit()
+        rules_db.init_db(self.con)
+        row = self.con.execute("SELECT MAX(v) FROM schema_version").fetchone()
+        self.assertEqual(row[0], rules_db.SCHEMA_VERSION)
+        # And the effective version read by _migrate is now current:
+        # (MAX(v) above proves the invariant; _migrate reads MAX(v) itself.)
 
 
 if __name__ == "__main__":

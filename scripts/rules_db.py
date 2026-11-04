@@ -119,20 +119,26 @@ def init_db(con):
 
 
 def _migrate(con):
-    row = con.execute("SELECT v FROM schema_version LIMIT 1").fetchone()
-    current = row[0] if row else 0
+    # MAX(v) rather than LIMIT 1: a stale row (e.g. v=0 left behind by a manual
+    # UPDATE or a partially applied migration) must not cause the effective
+    # version to regress. The highest recorded version is the current one.
+    row = con.execute("SELECT MAX(v) FROM schema_version").fetchone()
+    current = row[0] if row and row[0] is not None else 0
     if current >= SCHEMA_VERSION:
         return
+    # Future migrations go here, guarded by PRAGMA table_info checks.
+    # (Existing v1→v2 migration body unchanged.)
     if current < 2:
         cols = {r["name"] for r in con.execute("PRAGMA table_info(facts)")}
         if "fact_key" not in cols:
             con.execute("ALTER TABLE facts ADD COLUMN fact_key TEXT")
         if "fact_value" not in cols:
             con.execute("ALTER TABLE facts ADD COLUMN fact_value TEXT")
-    if current == 0:
-        con.execute("INSERT INTO schema_version(v) VALUES (?)", (SCHEMA_VERSION,))
-    else:
+    # Persist the new version. Always UPDATE if a row exists, INSERT otherwise.
+    if con.execute("SELECT 1 FROM schema_version LIMIT 1").fetchone():
         con.execute("UPDATE schema_version SET v=?", (SCHEMA_VERSION,))
+    else:
+        con.execute("INSERT INTO schema_version(v) VALUES (?)", (SCHEMA_VERSION,))
     con.commit()
 
 

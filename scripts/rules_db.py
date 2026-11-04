@@ -248,6 +248,32 @@ def cmd_export_md(con):
     print(f"exported {len(domains)} domain views")
 
 
+def cmd_export_index(con):
+    REF_DIR.mkdir(exist_ok=True)
+    rows = con.execute(
+        "SELECT DISTINCT domain FROM rules "
+        "WHERE domain IS NOT NULL AND domain != 'core' ORDER BY domain"
+    ).fetchall()
+    lines = []
+    for (d,) in rows:
+        # Collect tags from all active rules in this domain.
+        tag_rows = con.execute(
+            "SELECT tags FROM rules WHERE domain=? AND status='active'", (d,)
+        ).fetchall()
+        tags = set()
+        for (t,) in tag_rows:
+            if t:
+                tags.update(t.lower().split())
+        # Also include words from the domain itself so
+        # "web-delivery" contributes "web" and "delivery".
+        for word in re.split(r"[^a-z0-9]+", d.lower()):
+            if word:
+                tags.add(word)
+        lines.append(f"{d}: {' '.join(sorted(tags))}")
+    (REF_DIR / "_index.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"exported index for {len(rows)} domains")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -267,6 +293,7 @@ def main():
     l.add_argument("--method", default="keyword"); l.add_argument("--reason", default="")
     l.add_argument("--not-injected", action="store_true")
     sub.add_parser("export-md")
+    sub.add_parser("export-index")
     args = p.parse_args()
     con = connect()
     init_db(con)
@@ -278,7 +305,8 @@ def main():
      "query": lambda: cmd_query(con, args),
      "facts": lambda: cmd_facts(con, args),
      "log": lambda: cmd_log(con, args),
-     "export-md": lambda: cmd_export_md(con)}[args.cmd]()
+     "export-md": lambda: cmd_export_md(con),
+     "export-index": lambda: cmd_export_index(con)}[args.cmd]()
 
 
 if __name__ == "__main__":

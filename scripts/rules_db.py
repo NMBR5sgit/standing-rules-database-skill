@@ -15,7 +15,7 @@ Commands:
   log --task --rule-ids --method --reason   audit entry
   export-md                  regenerate references/*.md from the DB
 """
-import argparse, json, sqlite3, sys, datetime, pathlib
+import argparse, json, re, sqlite3, sys, datetime, pathlib
 
 SKILL_DIR = pathlib.Path(__file__).resolve().parent.parent
 DB_PATH = SKILL_DIR / "rules.db"
@@ -24,6 +24,47 @@ REF_DIR = SKILL_DIR / "references"
 
 def now():
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+_NON_ASCII_RE = re.compile(r"[^\x00-\x7f]")
+
+
+def _tokens(s: str) -> set:
+    """Lowercase ASCII alphanumeric tokens. CJK/other scripts are dropped;
+    queries containing them fall back to substring matching in cmd_query."""
+    return set(_TOKEN_RE.findall(s.lower()))
+
+
+def _stem(t: str) -> str:
+    """Conservative plural strip: a trailing 's' on a word longer than 3 chars.
+    Deliberately minimal — aggressive stemming introduces recall errors by
+    collapsing distinct words. The prefix path in _match subsumes -ing/-ed/-es
+    collisions; do not add a fuller stemmer."""
+    return t[:-1] if len(t) > 3 and t.endswith("s") else t
+
+
+def _stems(s: str) -> set:
+    return {_stem(t) for t in _tokens(s)}
+
+
+def _match(query: str, hay: str) -> bool:
+    """Token-set matcher: exact stem overlap, plus whole-token prefix
+    containment (min length 3). Word-internal substrings (mail->email) are
+    deliberately NOT matched — the old behavior was a false positive."""
+    q_tokens = set(_TOKEN_RE.findall(query.lower()))
+    h_tokens = set(_TOKEN_RE.findall(hay.lower()))
+    q_exact = {_stem(t) for t in q_tokens}
+    h_exact = {_stem(t) for t in h_tokens}
+    if q_exact & h_exact:
+        return True
+    q_pfx = {t for t in q_tokens if len(t) >= 3}
+    h_pfx = {t for t in h_tokens if len(t) >= 3}
+    for q in q_pfx:
+        for h in h_pfx:
+            if q.startswith(h) or h.startswith(q):
+                return True
+    return False
 
 
 def connect():
@@ -142,12 +183,22 @@ def cmd_query(con, a):
     t1 = con.execute("SELECT * FROM rules WHERE tier=1 AND status='active' ORDER BY rule_id").fetchall()
     matched = []
     if a.match:
-        kws = [k.lower() for k in a.match.split() if k]
+        # Non-ASCII queries (CJK, Cyrillic, etc.) cannot be tokenized correctly
+        # without a script-specific tokenizer, which would violate stdlib-only.
+        # Fall back to the previous substring behavior for those queries so that
+        # nothing is silently dropped. ASCII queries use token-set matching.
         rows = con.execute("SELECT * FROM rules WHERE tier=2 AND status='active'").fetchall()
-        for r in rows:
-            hay = " ".join(str(r[c] or "") for c in ("rule_id", "name", "text", "summary", "tags", "domain")).lower()
-            if any(k in hay for k in kws):
-                matched.append(r)
+        if _NON_ASCII_RE.search(a.match):
+            kws = [k.lower() for k in a.match.split() if k]
+            for r in rows:
+                hay = " ".join(str(r[c] or "") for c in ("rule_id", "name", "text", "summary", "tags", "domain")).lower()
+                if any(k in hay for k in kws):
+                    matched.append(r)
+        else:
+            for r in rows:
+                hay = " ".join(str(r[c] or "") for c in ("rule_id", "name", "text", "summary", "tags", "domain"))
+                if _match(a.match, hay):
+                    matched.append(r)
     if a.json:
         out = {"mandatory": [dict(r) for r in t1], "matched": [dict(r) for r in matched],
                "queried_at": now()}

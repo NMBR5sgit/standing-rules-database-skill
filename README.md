@@ -4,6 +4,8 @@ Agents that follow standing rules usually inject every rule into every prompt. T
 
 `standing-rules-database-skill` is the middle design: **a persistent rule database that grows, consulted per-task, with only the matching rules loaded into the job's context — while mandatory rules stay deterministically loaded.**
 
+**The skill ships mechanism only — it contains no rules of the author's.** Every rule in your database comes from your own system: scanned from your memory files at bootstrap, approved by you, stored locally. The author's rules never ship with the package.
+
 **The key property: storage and context cost are decoupled.** The number of rules is bound by *how many triggers match a given job*, not by how many rules are in the database. A 500-rule database costs the same context per job as a 30-rule one: mandatory rules (single-digit) are always loaded, each turn injects only the handful of rules whose triggers the job's wording touches, and everything else stays dormant until it's needed. Storage scales freely; attention stays cheap.
 
 ## How it works
@@ -18,8 +20,8 @@ Agents that follow standing rules usually inject every rule into every prompt. T
 
 ### Two kinds of triggers
 
-- **Task-domain triggers** — the job touches a system, project, or tool area (keywords from your own environment, e.g. a project name, a deploy target, a file type).
-- **Output-type triggers** — keyed to a property of the *artifact*, not the task: e.g. an `outbound` domain that loads whenever text will be seen by a third party (emails, listings, bylines, public comments). Whatever identity/contact rules *you* store ride along with any outbound text regardless of which task produced it.
+- **Task-domain triggers** — the job touches a system, project, or tool area (e.g. "scheduled delivery", "model swaps", "app packaging"). The domains are yours, derived from your own systems at bootstrap.
+- **Output-type triggers** — keyed to a property of the *artifact*, not the task: e.g. an `outbound` domain that loads whenever text will be seen by a third party (emails, listings, bylines, public comments). Whatever identity/contact rules *you* store ride along with any outbound text, regardless of which task produced it.
 
 ### Rule anatomy
 
@@ -66,6 +68,8 @@ The design grows the rule count from "what fits in a prompt" (~15–30) to "what
 Measured on a 31-rule database: a full `query --match` (tier-1 fetch + keyword match + priority sort) completes in **~0.09 s**, and five consecutive queries run in **0.45 s** wall time — Python interpreter startup dominates; the SQLite lookup itself is sub-millisecond. Rule count growth to hundreds of rules does not change per-job context cost, only the (still trivial) query time.
 
 ## Quick start
+
+The skill ships with **no rules of its own** — an empty database. At install, `scan_candidates.py` reads YOUR existing rule files (memory files, CLAUDE.md, AGENTS.md, notes) and proposes candidates; you approve what enters the database. Nothing from the author's system is pre-loaded.
 
 ```bash
 python scripts/rules_db.py init

@@ -22,12 +22,17 @@ Before starting ANY task: run the query, then apply only the matching rules. Con
 5. New standing rules go into the DB via the write gate below — never into always-injected memory unless tier-1.
 
 ## First-run bootstrap (new installs)
+
+The skill ships with **no rules** — an empty database. Your rules enter your system; they are not authored by this skill.
+
 1. `python scripts/rules_db.py init` — creates the empty schema.
-2. Optional import: `python scripts/scan_candidates.py <memory files / CLAUDE.md / AGENTS.md / notes dir>` — scans existing rule-like lines and writes `rule_candidates.json`. Candidates are PROPOSALS only: the user reviews/edits the JSON, then activates via `seed`/`add`. Nothing auto-activates (write-gate principle: no auto-promotion).
-3. Tier-1: the user copies their mandatory rules into their agent's always-injected memory too (identity, contact, format rules must not depend on a query).
+2. Import YOUR existing rules: `python scripts/scan_candidates.py <memory files / CLAUDE.md / AGENTS.md / notes dir>` — scans your system's rule-like lines and writes `rule_candidates.json`. Candidates are PROPOSALS only: the user reviews/edits the JSON, then activates via `seed`/`add`. Nothing auto-activates (write-gate principle: no auto-promotion).
+3. Tier-1: the user promotes their own few mandatory rules to tier 1 and mirrors them into their agent's always-injected memory too (identity, contact, format rules must not depend on a query).
+
+The seed file (`templates/seed.example.json`) is an intentionally EMPTY file showing only the shape — the content always comes from the user's own system.
 
 ## Dispatch index (query keywords for --match)
-Keep one line per domain. The domains are YOURS, derived from your own systems at bootstrap. Example shape:
+Keep one line per domain. The domains are YOURS — derived from your own systems/projects during bootstrap, not shipped by this skill. Example shape:
 
 | Domain | Trigger keywords (job touches any of these) |
 |---|---|
@@ -37,12 +42,7 @@ Keep one line per domain. The domains are YOURS, derived from your own systems a
 | `your-domain-2` | keywords for another system or output type |
 
 ## Tier 1 — HARD rules (deterministic retrieval: always-injected memory, never dependent on this skill being loaded)
-Tier-1 is YOURS — the few rules that must apply to every job no matter what. Keep them single-digit and mirror them into your agent's always-injected memory. Example shape:
-
-- [SR-T1a] Public identity is always X, never Y (legal/tax face).
-- [SR-T1b] Business contact is always A@B; never C for business.
-- [SR-T1c] A required output-format rule.
-- [SR-T1d] Quoted costs verified live, never from memory.
+Tier-1 is YOURS — the few rules that must apply to every job no matter what, imported from your own system at bootstrap. Keep them single-digit and mirror them into your agent's always-injected memory. Shape of a tier-1 entry: `[SR-T1x] <rule text>`, e.g. a required output-format rule, or a contact-identity rule for outbound text.
 
 ## Rule conventions
 - Stable IDs: rules are cited as [SR-xxx] so audits/conflicts can point at one rule, not a line.

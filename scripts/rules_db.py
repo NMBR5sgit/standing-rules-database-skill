@@ -76,6 +76,9 @@ def connect():
     return con
 
 
+SCHEMA_VERSION = 1
+
+
 def init_db(con):
     con.executescript("""
     CREATE TABLE IF NOT EXISTS rules(
@@ -109,7 +112,26 @@ def init_db(con):
     );
     CREATE INDEX IF NOT EXISTS idx_rules_domain ON rules(domain);
     CREATE INDEX IF NOT EXISTS idx_rules_status ON rules(status);
+    CREATE TABLE IF NOT EXISTS schema_version(v INTEGER NOT NULL);
     """)
+    con.commit()
+    _migrate(con)
+
+
+def _migrate(con):
+    row = con.execute("SELECT v FROM schema_version LIMIT 1").fetchone()
+    current = row[0] if row else 0
+    if current >= SCHEMA_VERSION:
+        return
+    # Future migrations go here, guarded by PRAGMA table_info checks:
+    # if current < 2:
+    #     cols = {r["name"] for r in con.execute("PRAGMA table_info(facts)")}
+    #     if "fact_key" not in cols:
+    #         con.execute("ALTER TABLE facts ADD COLUMN fact_key TEXT")
+    if current == 0:
+        con.execute("INSERT INTO schema_version(v) VALUES (?)", (SCHEMA_VERSION,))
+    else:
+        con.execute("UPDATE schema_version SET v=?", (SCHEMA_VERSION,))
     con.commit()
 
 

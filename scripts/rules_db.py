@@ -665,13 +665,17 @@ def cmd_sync(con, a):
     except Exception as e:
         sys.exit(f"sync: dashboard fetch failed ({type(e).__name__}: {e}); "
                  "local rules.db remains the source of truth")
-    if not isinstance(body, dict) or not isinstance(body.get("rules"), list):
-        sys.exit("sync: bad payload — expected {\"rules\": [...]}; nothing applied")
+    directives = {"wipe_org_rules"}
+    is_directive = isinstance(body, dict) and body.get("action") in directives
+    if not isinstance(body, dict) or (not isinstance(body.get("rules"), list)
+                                      and not is_directive):
+        sys.exit("sync: bad payload — expected {\"rules\": [...]} or a "
+                 "directive action (e.g. wipe_org_rules); nothing applied")
 
     applied = 0
     skipped_local = 0
     org_ids = set()
-    for r in body["rules"]:
+    for r in body.get("rules", []):
         rid = r.get("id") or r.get("rule_id")
         if not rid:
             continue

@@ -7,9 +7,10 @@ The markdown files under references/ are generated views (export-md).
 Commands:
   init                       create schema
   seed <seed.json>           bulk-load rules + facts (idempotent upsert)
-  add --id --name --text [--summary --tier --domain --priority --tags]  gate first!
+  add --id --name --text [--summary --tier --domain --priority --tags --owner]  gate first!
+  propose --id --name --text ...   add a rule in 'pending' (approval queue)
   update <id> --text --reason [--by]   auto-versions the old text
-  status <id> <disabled|deprecated|active> --reason
+  status <id> <active|disabled|deprecated|pending|rejected> --reason
   query --match "kw kw ..." [--json]   tier-1 always + tier-2 keyword matches
   facts [--domain X]                   facts for a domain
   log --task --rule-ids --method --reason   audit entry
@@ -329,12 +330,16 @@ def cmd_add(con, a):
     dup = con.execute("SELECT rule_id FROM rules WHERE rule_id=?", (a.id,)).fetchone()
     if dup:
         sys.exit(f"DUPLICATE: {a.id} already exists — use update instead")
+    proposed = getattr(a, "status", "active") == "pending"
     upsert_rule(con, {"id": a.id, "name": a.name, "text": a.text, "summary": a.summary,
                       "tier": a.tier, "domain": a.domain, "priority": a.priority,
                       "tags": a.tags, "owner": getattr(a, "owner", "local")})
+    if proposed:
+        con.execute("UPDATE rules SET status='pending' WHERE rule_id=?", (a.id,))
     con.commit()
-    print(f"added {a.id}")
-    _fire_sync_webhook(_write_event("rule_added", a.id, con))
+    event = "rule_proposed" if proposed else "rule_added"
+    print(f"{'proposed' if proposed else 'added'} {a.id}")
+    _fire_sync_webhook(_write_event(event, a.id, con))
 
 
 def cmd_update(con, a):
@@ -467,11 +472,18 @@ def main():
     a.add_argument("--text", required=True); a.add_argument("--summary"); a.add_argument("--tier", type=int, default=2)
     a.add_argument("--domain"); a.add_argument("--priority", default="MED"); a.add_argument("--tags")
     a.add_argument("--owner", choices=["local", "org"], default="local")
+    a.set_defaults(status="active")
+    pr = sub.add_parser("propose")  # approval-queue entry (Enterprise PRD §2.2)
+    pr.add_argument("--id", required=True); pr.add_argument("--name", required=True)
+    pr.add_argument("--text", required=True); pr.add_argument("--summary"); pr.add_argument("--tier", type=int, default=2)
+    pr.add_argument("--domain"); pr.add_argument("--priority", default="MED"); pr.add_argument("--tags")
+    pr.add_argument("--owner", choices=["local", "org"], default="local")
+    pr.set_defaults(status="pending")
     u = sub.add_parser("update"); u.add_argument("id"); u.add_argument("--text", required=True)
     u.add_argument("--reason", required=True); u.add_argument("--by", default="user")
     u.add_argument("--priority")
     st = sub.add_parser("status"); st.add_argument("id"); st.add_argument("state",
-        choices=["active", "disabled", "deprecated"]); st.add_argument("--reason", default="")
+        choices=["active", "disabled", "deprecated", "pending", "rejected"]); st.add_argument("--reason", default="")
     q = sub.add_parser("query"); q.add_argument("--match", default=""); q.add_argument("--json", action="store_true")
     f = sub.add_parser("facts"); f.add_argument("--domain"); f.add_argument("--verbose", action="store_true")
     l = sub.add_parser("log"); l.add_argument("--task", required=True); l.add_argument("--rule-ids", required=True)
@@ -486,6 +498,7 @@ def main():
     {"init": lambda: print("schema ready"),
      "seed": lambda: cmd_seed(con, args.path),
      "add": lambda: cmd_add(con, args),
+     "propose": lambda: cmd_add(con, args),
      "update": lambda: cmd_update(con, args),
      "status": lambda: cmd_status(con, args),
      "query": lambda: cmd_query(con, args),

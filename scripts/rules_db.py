@@ -48,6 +48,41 @@ def _stems(s: str) -> set:
     return {_stem(t) for t in _tokens(s)}
 
 
+def rule_matches(query: str, row) -> bool:
+    """Shared recall semantics for a rules-table row. THE single source of
+    truth for matching — the CLI (cmd_query) and the auto-consult hook both
+    call this. Do not re-implement matching elsewhere; local copies drift.
+    Non-ASCII queries fall back to substring matching (no script-specific
+    tokenizer without a dependency); ASCII queries use token-set matching."""
+    if not query:
+        return False
+    fields = ("rule_id", "name", "text", "summary", "tags", "domain")
+    hay = " ".join(str(row[c] or "") for c in fields if row[c] is not None)
+    if _NON_ASCII_RE.search(query):
+        kws = [k.lower() for k in query.split() if k]
+        hay_l = hay.lower()
+        return any(k in hay_l for k in kws)
+    return _match(query, hay)
+
+
+def query_rules(con, match_str: str) -> list:
+    """Returns tier-1 rules plus tier-2 rules matching match_str.
+    This is the single source of truth for query semantics.
+    Both cmd_query and external consult hooks must use this.
+    Tier-2 matches are ordered by priority (HIGH, MED, LOW)."""
+    t1 = con.execute(
+        "SELECT * FROM rules WHERE tier=1 AND status='active' ORDER BY rule_id"
+    ).fetchall()
+    matched = []
+    if match_str:
+        rows = con.execute(
+            "SELECT * FROM rules WHERE tier=2 AND status='active'").fetchall()
+        matched = [r for r in rows if rule_matches(match_str, r)]
+        rank = {"HIGH": 0, "MED": 1, "LOW": 2}
+        matched.sort(key=lambda r: rank.get(str(r["priority"] or "MED"), 1))
+    return list(t1) + matched
+
+
 def _match(query: str, hay: str) -> bool:
     """Token-set matcher: exact stem overlap, plus whole-token prefix
     containment (min length 3). Word-internal substrings (mail->email) are
@@ -214,25 +249,9 @@ def cmd_status(con, a):
 
 
 def cmd_query(con, a):
-    t1 = con.execute("SELECT * FROM rules WHERE tier=1 AND status='active' ORDER BY rule_id").fetchall()
-    matched = []
-    if a.match:
-        # Non-ASCII queries (CJK, Cyrillic, etc.) cannot be tokenized correctly
-        # without a script-specific tokenizer, which would violate stdlib-only.
-        # Fall back to the previous substring behavior for those queries so that
-        # nothing is silently dropped. ASCII queries use token-set matching.
-        rows = con.execute("SELECT * FROM rules WHERE tier=2 AND status='active'").fetchall()
-        if _NON_ASCII_RE.search(a.match):
-            kws = [k.lower() for k in a.match.split() if k]
-            for r in rows:
-                hay = " ".join(str(r[c] or "") for c in ("rule_id", "name", "text", "summary", "tags", "domain")).lower()
-                if any(k in hay for k in kws):
-                    matched.append(r)
-        else:
-            for r in rows:
-                hay = " ".join(str(r[c] or "") for c in ("rule_id", "name", "text", "summary", "tags", "domain"))
-                if _match(a.match, hay):
-                    matched.append(r)
+    rows = query_rules(con, a.match)
+    t1 = [r for r in rows if r["tier"] == 1]
+    matched = [r for r in rows if r["tier"] != 1]
     if a.json:
         out = {"mandatory": [dict(r) for r in t1], "matched": [dict(r) for r in matched],
                "queried_at": now()}

@@ -17,6 +17,7 @@ Commands:
   export-md                  regenerate references/*.md from the DB
   export-index               regenerate references/_index.txt
   audit --format <csv|json> [--out]   export the audit ledger
+  lockdown                   show the kill-switch (lockdown) state
 """
 import argparse, json, re, sqlite3, sys, datetime, pathlib
 import os
@@ -71,11 +72,59 @@ def rule_matches(query: str, row) -> bool:
     return _match(query, hay)
 
 
+LOCKDOWN_RULE_ID = "SR-KILL"
+LOCKDOWN_RULE_TEXT = "DENY ALL TASKS. Report to IT immediately."
+
+
+def get_lockdown(con):
+    """O(1) lookup: the lockdown lives in engine_state, not the rules table,
+    so no rule command can delete or edit it (user decision, Phase 2)."""
+    row = con.execute(
+        "SELECT state_value FROM engine_state WHERE state_key='lockdown'").fetchone()
+    if not row:
+        return None
+    try:
+        state = json.loads(row["state_value"])
+    except (ValueError, TypeError):
+        return None
+    return state if state.get("active") else None
+
+
+def set_lockdown(con, payload: dict):
+    """Apply the dashboard's Kill Switch payload (PRD §5) directly to
+    engine_state. Never touches the rules table."""
+    active = bool(payload.get("active"))
+    state = {
+        "active": active,
+        "rule_text": payload.get("rule_text") or LOCKDOWN_RULE_TEXT,
+        "reason": payload.get("reason", ""),
+        "issued_by": payload.get("issued_by", "dashboard"),
+        "issued_at": payload.get("issued_at") or now(),
+    }
+    con.execute(
+        "INSERT INTO engine_state(state_key,state_value) VALUES('lockdown',?) "
+        "ON CONFLICT(state_key) DO UPDATE SET state_value=excluded.state_value",
+        (json.dumps(state, ensure_ascii=False),))
+    _audit(con, state["issued_by"], "LOCKDOWN_ON" if active else "LOCKDOWN_OFF",
+           None, None, state)
+    return state
+
+
 def query_rules(con, match_str: str) -> list:
     """Returns tier-1 rules plus tier-2 rules matching match_str.
     This is the single source of truth for query semantics.
     Both cmd_query and external consult hooks must use this.
-    Tier-2 matches are ordered by priority (HIGH, MED, LOW)."""
+    Tier-2 matches are ordered by priority (HIGH, MED, LOW).
+    When the dashboard's Kill Switch is engaged (engine_state), the lockdown
+    rule is returned FIRST and no tier-2 rules match — total freeze."""
+    lockdown = get_lockdown(con)
+    if lockdown:
+        return [{"rule_id": LOCKDOWN_RULE_ID, "name": "KILL SWITCH",
+                 "text": lockdown["rule_text"], "summary": None, "tier": 1,
+                 "domain": "lockdown", "priority": "HIGH", "status": "active",
+                 "owner": "org", "tags": "lockdown",
+                 "created_at": lockdown["issued_at"], "updated_at": None,
+                 "effective_from": None}]
     t1 = con.execute(
         "SELECT * FROM rules WHERE tier=1 AND status='active' ORDER BY rule_id"
     ).fetchall()
@@ -117,7 +166,7 @@ def connect():
     return con
 
 
-SCHEMA_VERSION = 4   # v3: rules.owner+conflict_log; v4: audit_log (PRD §3.1)
+SCHEMA_VERSION = 5   # v4: audit_log; v5: engine_state (kill-switch lockdown)
 
 
 def init_db(con):
@@ -164,6 +213,10 @@ def init_db(con):
       audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
       ts TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL,
       rule_id TEXT, before_state TEXT, after_state TEXT
+    );
+    CREATE TABLE IF NOT EXISTS engine_state(
+      state_key TEXT PRIMARY KEY,
+      state_value TEXT NOT NULL
     );
     """)
     con.commit()
@@ -245,6 +298,14 @@ def _write_event(event: str, rule_id, con, extra=None):
     }
 
 
+def _reject_if_lockdown(con, action):
+    """Kill Switch engaged: the local engine freezes. No rule writes except
+    `sync` (which is how IT lifts the lockdown)."""
+    if get_lockdown(con):
+        sys.exit("ERROR: LOCKDOWN active — all rule changes are frozen. "
+                 "Contact IT.")
+
+
 def _reject_if_org_owned(con, rule_id, action, attempted_by):
     """Hard enforcement (Enterprise PRD §2.3): org-owned rules are immutable
     on the local machine — the dashboard is their source of truth.
@@ -280,8 +341,9 @@ def _state_blob(row):
     """Compact before/after snapshot for the audit ledger (PRD §3.1)."""
     if row is None:
         return None
+    d = dict(row)
     keys = ("text", "priority", "status", "tier", "owner", "domain")
-    return json.dumps({k: row[k] for k in keys if row[k] is not None},
+    return json.dumps({k: d[k] for k in keys if d.get(k) is not None},
                       ensure_ascii=False)
 
 
@@ -314,6 +376,7 @@ def upsert_rule(con, r):
 
 
 def cmd_seed(con, path):
+    _reject_if_lockdown(con, "seed")
     data = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
     rules_count = len(data.get("rules", []))
     rules_skipped = 0
@@ -355,6 +418,7 @@ def cmd_seed(con, path):
 
 
 def cmd_add(con, a):
+    _reject_if_lockdown(con, "add")
     dup = con.execute("SELECT rule_id FROM rules WHERE rule_id=?", (a.id,)).fetchone()
     if dup:
         sys.exit(f"DUPLICATE: {a.id} already exists — use update instead")
@@ -376,6 +440,7 @@ def cmd_update(con, a):
     row = con.execute("SELECT * FROM rules WHERE rule_id=?", (a.id,)).fetchone()
     if not row:
         sys.exit(f"not found: {a.id}")
+    _reject_if_lockdown(con, "update")
     _reject_if_org_owned(con, a.id, "update", a.by)
     v = con.execute("SELECT COALESCE(MAX(version_number),0)+1 FROM rule_versions WHERE rule_id=?",
                     (a.id,)).fetchone()[0]
@@ -391,6 +456,7 @@ def cmd_update(con, a):
 
 
 def cmd_status(con, a):
+    _reject_if_lockdown(con, "status")
     _reject_if_org_owned(con, a.id, "status", a.reason or "user")
     before = con.execute("SELECT * FROM rules WHERE rule_id=?", (a.id,)).fetchone()
     con.execute("UPDATE rules SET status=?, updated_at=? WHERE rule_id=?", (a.state, now(), a.id))
@@ -585,6 +651,13 @@ def cmd_sync(con, a):
             _audit(con, "sync", "WITHDRAWN", row["rule_id"], before, after)
             withdrawn += 1
 
+    lockdown = body.get("lockdown")
+    lockdown_note = ""
+    if isinstance(lockdown, dict):
+        state = set_lockdown(con, lockdown)
+        lockdown_note = (f", lockdown={'ENGAGED' if state['active'] else 'lifted'}"
+                         f" ({state['rule_text']})")
+
     con.commit()
     msg = f"sync: {applied} org rules applied"
     if wiped:
@@ -593,7 +666,18 @@ def cmd_sync(con, a):
         msg += f", {withdrawn} withdrawn rules deprecated"
     if skipped_local:
         msg += f", {skipped_local} non-org entries skipped"
+    msg += lockdown_note
     print(msg)
+
+
+def cmd_lockdown(con, a):
+    """Inspect the kill-switch state locally (IT verification). Read-only."""
+    state = get_lockdown(con)
+    if state is None:
+        print("lockdown: off (normal operation)")
+    else:
+        print(f"lockdown: ENGAGED — {state['rule_text']} "
+              f"(issued {state['issued_at']} by {state['issued_by']}: {state['reason']})")
 
 
 def main():
@@ -625,6 +709,7 @@ def main():
     sub.add_parser("export-md")
     sub.add_parser("export-index")
     au = sub.add_parser("audit"); au.add_argument("--format", choices=["csv", "json"], default="csv"); au.add_argument("--out")
+    sub.add_parser("lockdown")  # read the kill-switch state (PRD §5)
     s = sub.add_parser("sync")  # enterprise dashboard pull (skeleton; Phase 3)
     args = p.parse_args()
     con = connect()
@@ -641,6 +726,7 @@ def main():
      "export-md": lambda: cmd_export_md(con),
      "export-index": lambda: cmd_export_index(con),
      "audit": lambda: cmd_audit(con, args),
+     "lockdown": lambda: cmd_lockdown(con, args),
      "sync": lambda: cmd_sync(con, args)}[args.cmd]()
 
 

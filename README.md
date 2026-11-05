@@ -77,9 +77,19 @@ Query latency for the matching loop is **~0.39 ms** (average over 100 warm `quer
 
 ## Enterprise Sync (Optional)
 
-The local engine runs independently. However, if you are using a centralized dashboard, you can set `STANDING_RULES_SYNC_URL` to enable one-way telemetry for rule creation. The agent's query time remains 0.39ms because reads are always local.
+The local engine runs independently. However, if you are using a centralized dashboard, you can set `STANDING_RULES_SYNC_URL` to connect it. The agent's query time remains ~0.39ms because reads are always local — the dashboard is a **sync target**, never an API the agent depends on.
 
-With the variable unset (the default), the engine makes zero network calls and spawns zero threads — writes complete exactly as in the local-only version. With it set, successful writes (`add`, `update`, `status`, `seed`) fire a fire-and-forget webhook POST to the dashboard; it is capped at 2 seconds and fails silently, because the local `rules.db` is always the source of truth. `rules_db.py sync` pulls the organization's master rules (fetch body in a later sprint); without the URL configured it exits with a clear error.
+With the variable unset (the default), the engine makes zero network calls and spawns zero threads — writes complete exactly as in the local-only version. With it set, the following local-core features activate:
+
+- **Write telemetry** — successful writes (`add`, `update`, `status`, `seed`, `propose`) fire a fire-and-forget webhook POST to the dashboard; capped at 2 seconds, fails silently, always after the local commit. The local `rules.db` remains the source of truth.
+- **Org-owned rules** — rules carry an `owner` column (`local` | `org`). Any local attempt to `update` or `status`-change an org-owned rule hard-rejects with `ERROR: Cannot modify org-owned rule SR-XXX. Contact IT.`, logs the attempt to `conflict_log`, and fires a `policy_bypass_attempt` webhook so IT sees it.
+- **Approval queue** — `propose` creates a rule in `pending` state; nothing about a pending rule is enforced until IT approves it to `active` (or rejects it). No auto-promotion.
+- **Sync pull with revocation** — `rules_db.py sync` fetches `<URL>/rules.json`, upserts org-owned rules locally (never clobbering local-owned rows), and revokes org rules missing from the master file: they are snapshotted into `rule_versions` and `DELETE`d from `rules`. An unreachable dashboard exits clean with the local DB untouched.
+- **Kill Switch lockdown** — the sync payload can engage a lockdown stored in a dedicated `engine_state` table (O(1) check, immune to rule CRUD). While engaged, queries return only the lockdown Tier-1 rule and every local write verb freezes; `sync` is the only way IT lifts it. Inspect state with `rules_db.py lockdown`.
+- **Audit ledger** — every state change appends an immutable `audit_log` row with before/after snapshots; `rules_db.py audit --format csv|json` exports it for the dashboard.
+- **Query analytics** — with the URL set, each query appends one local `query_telemetry` row; every 20 queries flush as a single batched webhook. Unset means zero rows, zero threads, zero network — the hot query path is untouched.
+
+All webhook and sync paths are stdlib-only (`urllib`), fail-open, and require no server, queue, or third-party dependency.
 
 ## Quick start
 

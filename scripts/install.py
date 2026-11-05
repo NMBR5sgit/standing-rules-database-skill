@@ -2,11 +2,13 @@
 """IT provisioner: one-line enterprise rollout.
 
 Usage:
-    python scripts/install.py --sync-url https://rules.example.com [--agent claude|cursor|hermes]
+    python scripts/install.py --sync-url https://rules.example.com [--agent claude|cursor|hermes|aider]
 
 Sets STANDING_RULES_SYNC_URL permanently for the machine user, initializes
-the local rules DB, and runs the first sync pull. Stdlib only — same
-zero-dependency contract as the engine itself.
+the local rules DB, and runs the first sync pull. When --agent is omitted,
+every installed agent (Hermes, Claude Code, Cursor, Aider) is detected and
+reported; the persistent env var is user-global, so all of them pick it up.
+Stdlib only — same zero-dependency contract as the engine itself.
 
 STANDING_RULES_SYNC_TOKEN is honored when already present in the
 environment, or supplied via --token (written persistently alongside the
@@ -21,15 +23,19 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import rules_db  # noqa: E402  (same directory; stdlib-only engine)
 
-AGENT_BINARIES = {"hermes": "hermes", "claude": "claude", "cursor": "cursor"}
+AGENT_BINARIES = {"hermes": "hermes", "claude": "claude",
+                  "cursor": "cursor", "aider": "aider"}
 
 
-def detect_agent() -> str | None:
-    """Best-effort agent detection from well-known CLI binaries on PATH."""
-    for name, binary in AGENT_BINARIES.items():
-        if shutil.which(binary):
-            return name
-    return None
+def detect_agents() -> list[str]:
+    """Best-effort multi-agent detection from well-known CLI binaries on PATH.
+
+    Returns EVERY installed agent, not the first one found — the persistent
+    env var is user-global (setx / shell rc), so all detected agents pick it
+    up after the next restart.
+    """
+    return [name for name, binary in AGENT_BINARIES.items()
+            if shutil.which(binary)]
 
 
 def append_rc_exports(home: pathlib.Path, pairs: list[tuple[str, str]]) -> pathlib.Path:
@@ -78,8 +84,15 @@ def main(argv: list[str] | None = None) -> None:
                          "STANDING_RULES_SYNC_TOKEN in the environment)")
     args = ap.parse_args(argv)
 
-    agent = args.agent or detect_agent()
-    print(f"install: agent={agent or 'none detected (env var is agent-agnostic)'}")
+    if args.agent:
+        agents = [args.agent]
+        print(f"install: agent={args.agent} (explicit --agent override)")
+    else:
+        agents = detect_agents()
+        if agents:
+            print(f"install: detected agents: {', '.join(agents)}")
+        else:
+            print("install: no agents detected (env var is agent-agnostic)")
 
     # Visible to this process too, before the persistent write takes effect
     os.environ["STANDING_RULES_SYNC_URL"] = args.sync_url
@@ -100,8 +113,13 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(f"install: {exc}")
     con.close()
 
-    print(f"Provisioning complete. Rules synced from {args.sync_url}. "
-          "Agent will pick up the environment variable on next restart.")
+    if len(agents) > 1:
+        print(f"Provisioning complete. Rules synced from {args.sync_url}. "
+              f"Configured {len(agents)} agents ({', '.join(agents)}); each will "
+              "pick up the environment variable on next restart.")
+    else:
+        print(f"Provisioning complete. Rules synced from {args.sync_url}. "
+              "Agent will pick up the environment variable on next restart.")
 
 
 if __name__ == "__main__":

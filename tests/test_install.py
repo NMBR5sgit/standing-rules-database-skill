@@ -151,15 +151,53 @@ class InstallProvisionerTest(unittest.TestCase):
                               "--agent", "cursor"])
         self.assertIn("SYNC_TOKEN", str(cm.exception))
 
-    def test_agent_autodetect_and_flag(self):
+    def test_agent_autodetect_finds_all_installed(self):
         real_which = install.shutil.which
-        install.shutil.which = lambda name: "/usr/bin/claude" if name == "claude" else None
+        install.shutil.which = lambda name: (
+            f"/usr/bin/{name}" if name in ("claude", "hermes", "aider") else None)
         try:
-            self.assertEqual(install.detect_agent(), "claude")
+            self.assertEqual(install.detect_agents(), ["hermes", "claude", "aider"])
             install.shutil.which = lambda name: None
-            self.assertIsNone(install.detect_agent())
+            self.assertEqual(install.detect_agents(), [])
         finally:
             install.shutil.which = real_which
+
+    def test_multi_agent_flow_reports_every_detected_agent(self):
+        self._sandbox_persist()
+        self._mock_http({"rules": []})
+        real_which = install.shutil.which
+        install.shutil.which = lambda name: (
+            f"/usr/bin/{name}" if name in ("hermes", "claude") else None)
+        try:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                install.main(["--sync-url", "http://dashboard.invalid",
+                              "--token", "tok-123"])
+        finally:
+            install.shutil.which = real_which
+        out = buf.getvalue()
+        self.assertIn("detected agents: hermes, claude", out)
+        self.assertIn("Configured 2 agents (hermes, claude)", out)
+        self.assertIn("Provisioning complete. Rules synced from http://dashboard.invalid.", out)
+
+    def test_explicit_agent_flag_overrides_detection(self):
+        self._sandbox_persist()
+        self._mock_http({"rules": []})
+        real_which = install.shutil.which
+        install.shutil.which = lambda name: (
+            f"/usr/bin/{name}" if name in ("hermes", "claude") else None)
+        try:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                install.main(["--sync-url", "http://dashboard.invalid",
+                              "--agent", "claude", "--token", "tok-123"])
+        finally:
+            install.shutil.which = real_which
+        out = buf.getvalue()
+        # explicit override configures ONLY that agent, no detection list
+        self.assertIn("agent=claude (explicit --agent override)", out)
+        self.assertNotIn("detected agents", out)
+        self.assertIn("Agent will pick up the environment variable on next restart.", out)
 
 
 if __name__ == "__main__":

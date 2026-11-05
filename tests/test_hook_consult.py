@@ -32,6 +32,9 @@ def _run_hook(home, user_message):
     return json.loads(out) if out else None
 
 
+@unittest.skipUnless(
+    os.path.isdir(SKILL_DIR) and os.path.isfile(HOOK),
+    "requires a Hermes install (SKILL_DIR/HOOK not present)")
 class HookRecallTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

@@ -113,6 +113,24 @@ Or install it as a skill directly:
 npx skills add NMBR5sgit/standing-rules-database-skill
 ```
 
+## Using without Hermes
+
+The core engine (`scripts/rules_db.py`) is standard-library Python and works with any agent that can run shell commands. The two-tier method — tier-1 mirrored into always-injected memory plus a SKILL.md dispatch index, queried before each task — is agent-agnostic. The Hermes auto-consult hook (`standing_rules_consult.py`) is optional and Hermes-specific; on other agents you follow the SKILL.md "consult before task" instruction manually, with identical `query_rules` semantics. Note that `SKILL.md` frontmatter uses a `hermes:` metadata key, so porting to Claude Code means adapting the frontmatter wrapper only — the mechanism is unchanged.
+
+### Agent Compatibility
+
+Because the core engine is standard-library Python, it is not tied to any specific agent framework. It works with any local agent or tool that can execute shell commands and read instruction files (like `SKILL.md`).
+
+**Works out of the box:**
+- Claude Code (CLI)
+- Cursor / Windsurf (via terminal access)
+- Aider
+- Custom Python scripts, LangChain, AutoGen (by importing `query_rules` or calling the CLI)
+- Standard cron jobs or shell scripts
+
+**Does not work with:**
+- Pure web-chat interfaces (ChatGPT, Claude Web) where local code cannot be executed. (In these cases, you would have to manually copy-paste the rule text).
+
 ## Credits
 
 Design synthesized from: the Hermes skills system (always-injected memory + on-demand skill loading), `adeonir/agent-skills@rule-creator` (dispatch tables, write gates, rule format discipline), `akitaonrails/ai-memory` (mandatory pre-work retrieval habit, pinned-context concept), and an independent design review (two-tier retrieval, rules-vs-facts, stable IDs, status lifecycle, authority boundary, proportionality).

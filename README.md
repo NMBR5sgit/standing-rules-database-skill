@@ -75,6 +75,12 @@ Real-world measurements on a 38-rule database (7 tier-1, 31 tier-2) show the str
 
 Query latency for the matching loop is **~0.39 ms** (average over 100 warm `query_rules` runs per query on the live database; per-query averages ranged 0.37–0.42 ms). Python interpreter startup dominates the CLI execution time. Rule count growth to hundreds of rules does not change per-job context cost, only the (still trivial) query time.
 
+## Enterprise Sync (Optional)
+
+The local engine runs independently. However, if you are using a centralized dashboard, you can set `STANDING_RULES_SYNC_URL` to enable one-way telemetry for rule creation. The agent's query time remains 0.39ms because reads are always local.
+
+With the variable unset (the default), the engine makes zero network calls and spawns zero threads — writes complete exactly as in the local-only version. With it set, successful writes (`add`, `update`, `status`, `seed`) fire a fire-and-forget webhook POST to the dashboard; it is capped at 2 seconds and fails silently, because the local `rules.db` is always the source of truth. `rules_db.py sync` pulls the organization's master rules (fetch body in a later sprint); without the URL configured it exits with a clear error.
+
 ## Quick start
 
 The skill ships with **no rules of its own** — an empty database. At install, `scan_candidates.py` reads YOUR existing rule files (memory files, CLAUDE.md, AGENTS.md, notes) and proposes candidates; you approve what enters the database. Nothing from the author's system is pre-loaded.

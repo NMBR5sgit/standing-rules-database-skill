@@ -16,6 +16,9 @@ Commands:
   export-md                  regenerate references/*.md from the DB
 """
 import argparse, json, re, sqlite3, sys, datetime, pathlib
+import os
+import threading
+import urllib.request
 
 SKILL_DIR = pathlib.Path(__file__).resolve().parent.parent
 DB_PATH = SKILL_DIR / "rules.db"
@@ -177,6 +180,57 @@ def _migrate(con):
     con.commit()
 
 
+def _fire_sync_webhook(payload: dict):
+    """Fire-and-forget webhook to the Enterprise Dashboard if configured.
+    This must NEVER block the CLI or raise an exception to the user.
+    When STANDING_RULES_SYNC_URL is unset (the default for local-only users),
+    this returns immediately: zero threads, zero network, zero overhead.
+    The local DB remains the source of truth; a dropped packet is acceptable."""
+    url = os.environ.get("STANDING_RULES_SYNC_URL")
+    if not url:
+        return
+
+    def _send():
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            # 2-second timeout max. If the dashboard is slow, we drop the packet.
+            urllib.request.urlopen(req, timeout=2)
+        except Exception:
+            pass  # Fail silently. The local DB is the source of truth.
+
+    # Run in a daemon thread so the CLI exits immediately
+    t = threading.Thread(target=_send)
+    t.daemon = True
+    t.start()
+
+
+def _write_event(event: str, rule_id, con, extra=None):
+    """Build the webhook payload after a successful local write."""
+    data = None
+    if rule_id is not None:
+        row = con.execute("SELECT * FROM rules WHERE rule_id=?", (rule_id,)).fetchone()
+        data = dict(row) if row else None
+    if extra:
+        data = {**(data or {}), **extra}
+    try:
+        host = os.environ.get("COMPUTERNAME") or os.uname().nodename
+    except AttributeError:
+        host = "unknown"
+    return {
+        "event": event,
+        "rule_id": rule_id,
+        "data": data,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc)
+                        .isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "source_machine": host,
+    }
+
+
 def upsert_rule(con, r):
     cur = con.execute("SELECT 1 FROM rules WHERE rule_id=?", (r["id"],))
     if cur.fetchone():
@@ -216,6 +270,13 @@ def cmd_seed(con, path):
     con.commit()
     print(f"seeded {rules_count} rules, inserted {facts_inserted} facts, "
           f"skipped {facts_skipped} duplicate facts")
+    # Seed is bulk: one aggregate event instead of one webhook per rule
+    # (a 5000-candidate seed must not spawn a thread storm).
+    _fire_sync_webhook(_write_event(
+        "seed_applied", None, con,
+        extra={"rule_ids": [r["id"] for r in data.get("rules", [])],
+               "rules_count": rules_count,
+               "facts_inserted": facts_inserted}))
 
 
 def cmd_add(con, a):
@@ -226,6 +287,7 @@ def cmd_add(con, a):
                       "tier": a.tier, "domain": a.domain, "priority": a.priority, "tags": a.tags})
     con.commit()
     print(f"added {a.id}")
+    _fire_sync_webhook(_write_event("rule_added", a.id, con))
 
 
 def cmd_update(con, a):
@@ -240,12 +302,14 @@ def cmd_update(con, a):
                 (a.text, a.priority or row["priority"], now(), a.id))
     con.commit()
     print(f"updated {a.id}; old text archived as version {v}")
+    _fire_sync_webhook(_write_event("rule_updated", a.id, con))
 
 
 def cmd_status(con, a):
     con.execute("UPDATE rules SET status=?, updated_at=? WHERE rule_id=?", (a.state, now(), a.id))
     con.commit()
     print(f"{a.id} -> {a.state} ({a.reason})")
+    _fire_sync_webhook(_write_event("rule_status_changed", a.id, con))
 
 
 def cmd_query(con, a):
@@ -330,6 +394,21 @@ def cmd_export_index(con):
     print(f"exported index for {len(rows)} domains")
 
 
+def cmd_sync(con, a):
+    """Pull the organization's master rules from the dashboard and upsert
+    them locally. Skeleton for now: the fetch/upsert body lands in a later
+    sprint with the dashboard; the command surface is ready."""
+    url = os.environ.get("STANDING_RULES_SYNC_URL")
+    if not url:
+        sys.exit("ERROR: STANDING_RULES_SYNC_URL is not set. Sync is disabled.")
+    # Planned (next sprint):
+    #   1. Fetch the master rules.json from the dashboard
+    #   2. Upsert them into the local DB
+    #   3. Mark them as 'org-rules' in the DB (so they can't be locally deleted)
+    print("sync: dashboard sync fetch not implemented yet "
+          f"(target configured: {url})")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -350,6 +429,7 @@ def main():
     l.add_argument("--not-injected", action="store_true")
     sub.add_parser("export-md")
     sub.add_parser("export-index")
+    sub.add_parser("sync")  # enterprise dashboard pull (skeleton; Phase 3)
     args = p.parse_args()
     con = connect()
     init_db(con)
@@ -362,7 +442,8 @@ def main():
      "facts": lambda: cmd_facts(con, args),
      "log": lambda: cmd_log(con, args),
      "export-md": lambda: cmd_export_md(con),
-     "export-index": lambda: cmd_export_index(con)}[args.cmd]()
+     "export-index": lambda: cmd_export_index(con),
+     "sync": lambda: cmd_sync(con, args)}[args.cmd]()
 
 
 if __name__ == "__main__":

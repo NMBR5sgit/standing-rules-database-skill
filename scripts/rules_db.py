@@ -513,17 +513,87 @@ def cmd_audit(con, a):
 
 def cmd_sync(con, a):
     """Pull the organization's master rules from the dashboard and upsert
-    them locally. Skeleton for now: the fetch/upsert body lands in a later
-    sprint with the dashboard; the command surface is ready."""
+    them locally. The local DB stays the source of truth; the dashboard is
+    a sync target, not an API the agent depends on."""
     url = os.environ.get("STANDING_RULES_SYNC_URL")
     if not url:
         sys.exit("ERROR: STANDING_RULES_SYNC_URL is not set. Sync is disabled.")
-    # Planned (next sprint):
-    #   1. Fetch the master rules.json from the dashboard
-    #   2. Upsert them into the local DB
-    #   3. Mark them as 'org-rules' in the DB (so they can't be locally deleted)
-    print("sync: dashboard sync fetch not implemented yet "
-          f"(target configured: {url})")
+    fetch_url = url.rstrip("/") + "/rules.json"
+    try:
+        req = urllib.request.Request(fetch_url, method="GET")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        sys.exit(f"sync: dashboard fetch failed ({type(e).__name__}: {e}); "
+                 "local rules.db remains the source of truth")
+    if not isinstance(body, dict) or not isinstance(body.get("rules"), list):
+        sys.exit("sync: bad payload — expected {\"rules\": [...]}; nothing applied")
+
+    applied = 0
+    skipped_local = 0
+    org_ids = set()
+    for r in body["rules"]:
+        rid = r.get("id") or r.get("rule_id")
+        if not rid:
+            continue
+        owner = r.get("owner", "org")
+        if owner != "org":
+            # The org master file must not clobber locally-owned rules
+            # unless it explicitly marks them org-owned.
+            skipped_local += 1
+            continue
+        org_ids.add(rid)
+        before = con.execute("SELECT * FROM rules WHERE rule_id=?", (rid,)).fetchone()
+        upsert_rule(con, {**r, "id": rid, "owner": "org", "_org_write": True})
+        after = con.execute("SELECT * FROM rules WHERE rule_id=?", (rid,)).fetchone()
+        _audit(con, "sync", "SYNC", rid, before, after)
+        applied += 1
+
+    # Revocation handler (PRD §3.3): the dashboard can send an explicit
+    # {"status":"revoked","action":"wipe_org_rules"} directive — archive all
+    # org-owned rules to rule_versions, then DELETE them. owner='local'
+    # rules are never touched by a wipe.
+    wipe_applied = body.get("action") == "wipe_org_rules"
+    wiped = 0
+    if wipe_applied:
+        for row in con.execute("SELECT * FROM rules WHERE owner='org'").fetchall():
+            v = con.execute(
+                "SELECT COALESCE(MAX(version_number),0)+1 FROM rule_versions "
+                "WHERE rule_id=?", (row["rule_id"],)).fetchone()[0]
+            con.execute(
+                "INSERT INTO rule_versions(rule_id,version_number,name,text,"
+                "priority,status,change_reason,changed_by,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (row["rule_id"], v, row["name"], row["text"], row["priority"],
+                 "revoked", "wipe_org_rules", "sync", now()))
+            con.execute("DELETE FROM rules WHERE rule_id=?", (row["rule_id"],))
+            _audit(con, "sync", "WIPED", row["rule_id"], row, None)
+            wiped += 1
+
+    # Rules the org withdrew: deprecate the local copy (never delete —
+    # version history stays queryable). Skipped during a wipe (already gone).
+    withdrawn = 0
+    for row in con.execute(
+            "SELECT rule_id FROM rules WHERE owner='org' AND status='active'").fetchall():
+        if row["rule_id"] not in org_ids:
+            before = con.execute("SELECT * FROM rules WHERE rule_id=?",
+                                 (row["rule_id"],)).fetchone()
+            con.execute("UPDATE rules SET status='deprecated', updated_at=? WHERE rule_id=?",
+                        (now(), row["rule_id"]))
+            after = con.execute("SELECT * FROM rules WHERE rule_id=?",
+                                (row["rule_id"],)).fetchone()
+            _audit(con, "sync", "WITHDRAWN", row["rule_id"], before, after)
+            withdrawn += 1
+
+    con.commit()
+    msg = f"sync: {applied} org rules applied"
+    if wiped:
+        msg += f", {wiped} org rules wiped"
+    if withdrawn:
+        msg += f", {withdrawn} withdrawn rules deprecated"
+    if skipped_local:
+        msg += f", {skipped_local} non-org entries skipped"
+    print(msg)
 
 
 def main():

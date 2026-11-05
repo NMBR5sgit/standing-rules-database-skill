@@ -15,6 +15,8 @@ Commands:
   facts [--domain X]                   facts for a domain
   log --task --rule-ids --method --reason   audit entry
   export-md                  regenerate references/*.md from the DB
+  export-index               regenerate references/_index.txt
+  audit --format <csv|json> [--out]   export the audit ledger
 """
 import argparse, json, re, sqlite3, sys, datetime, pathlib
 import os
@@ -115,7 +117,7 @@ def connect():
     return con
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4   # v3: rules.owner+conflict_log; v4: audit_log (PRD §3.1)
 
 
 def init_db(con):
@@ -157,6 +159,11 @@ def init_db(con):
       conflict_id INTEGER PRIMARY KEY AUTOINCREMENT,
       rule_id TEXT, action TEXT, attempted_by TEXT,
       detail TEXT, created_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS audit_log(
+      audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL,
+      rule_id TEXT, before_state TEXT, after_state TEXT
     );
     """)
     con.commit()
@@ -269,6 +276,23 @@ def _source_machine():
         return "unknown"
 
 
+def _state_blob(row):
+    """Compact before/after snapshot for the audit ledger (PRD §3.1)."""
+    if row is None:
+        return None
+    keys = ("text", "priority", "status", "tier", "owner", "domain")
+    return json.dumps({k: row[k] for k in keys if row[k] is not None},
+                      ensure_ascii=False)
+
+
+def _audit(con, actor, action, rule_id, before, after):
+    """Immutable ledger entry: [ts][actor][action][rule_id][before][after]."""
+    con.execute(
+        "INSERT INTO audit_log(ts,actor,action,rule_id,before_state,after_state) "
+        "VALUES(?,?,?,?,?,?)",
+        (now(), actor, action, rule_id, _state_blob(before), _state_blob(after)))
+
+
 def upsert_rule(con, r):
     cur = con.execute("SELECT owner FROM rules WHERE rule_id=?", (r["id"],))
     row = cur.fetchone()
@@ -294,7 +318,11 @@ def cmd_seed(con, path):
     rules_count = len(data.get("rules", []))
     rules_skipped = 0
     for r in data.get("rules", []):
-        if not upsert_rule(con, r):
+        before = con.execute("SELECT * FROM rules WHERE rule_id=?", (r["id"],)).fetchone()
+        if upsert_rule(con, r):
+            after = con.execute("SELECT * FROM rules WHERE rule_id=?", (r["id"],)).fetchone()
+            _audit(con, "seed", "SEED", r["id"], before, after)
+        else:
             rules_skipped += 1
     facts_inserted = 0
     facts_skipped = 0
@@ -336,6 +364,8 @@ def cmd_add(con, a):
                       "tags": a.tags, "owner": getattr(a, "owner", "local")})
     if proposed:
         con.execute("UPDATE rules SET status='pending' WHERE rule_id=?", (a.id,))
+    _audit(con, getattr(a, "by", "user"), "PROPOSED" if proposed else "ADDED",
+           a.id, None, con.execute("SELECT * FROM rules WHERE rule_id=?", (a.id,)).fetchone())
     con.commit()
     event = "rule_proposed" if proposed else "rule_added"
     print(f"{'proposed' if proposed else 'added'} {a.id}")
@@ -353,6 +383,8 @@ def cmd_update(con, a):
                 (a.id, v, row["name"], row["text"], row["priority"], row["status"], a.reason, a.by, now()))
     con.execute("UPDATE rules SET text=?, priority=?, updated_at=? WHERE rule_id=?",
                 (a.text, a.priority or row["priority"], now(), a.id))
+    _audit(con, a.by, "UPDATED", a.id, row,
+           con.execute("SELECT * FROM rules WHERE rule_id=?", (a.id,)).fetchone())
     con.commit()
     print(f"updated {a.id}; old text archived as version {v}")
     _fire_sync_webhook(_write_event("rule_updated", a.id, con))
@@ -360,7 +392,10 @@ def cmd_update(con, a):
 
 def cmd_status(con, a):
     _reject_if_org_owned(con, a.id, "status", a.reason or "user")
+    before = con.execute("SELECT * FROM rules WHERE rule_id=?", (a.id,)).fetchone()
     con.execute("UPDATE rules SET status=?, updated_at=? WHERE rule_id=?", (a.state, now(), a.id))
+    _audit(con, a.reason or "user", "STATUS", a.id, before,
+           con.execute("SELECT * FROM rules WHERE rule_id=?", (a.id,)).fetchone())
     con.commit()
     print(f"{a.id} -> {a.state} ({a.reason})")
     _fire_sync_webhook(_write_event("rule_status_changed", a.id, con))
@@ -448,6 +483,34 @@ def cmd_export_index(con):
     print(f"exported index for {len(rows)} domains")
 
 
+def cmd_audit(con, a):
+    """Export the audit ledger (PRD §3.1) as CSV or JSON for the dashboard."""
+    rows = con.execute(
+        "SELECT ts,actor,action,rule_id,before_state,after_state "
+        "FROM audit_log ORDER BY audit_id").fetchall()
+    fmt = a.format
+    if a.out:
+        out_path = pathlib.Path(a.out)
+    else:
+        out_path = REF_DIR / f"audit_log.{fmt}"
+        REF_DIR.mkdir(exist_ok=True)
+    if fmt == "csv":
+        buf = ["ts,actor,action,rule_id,before_state,after_state"]
+        for r in rows:
+            cols = []
+            for v in (r["ts"], r["actor"], r["action"], r["rule_id"],
+                      r["before_state"], r["after_state"]):
+                s = "" if v is None else str(v)
+                cols.append('"' + s.replace('"', '""') + '"')
+            buf.append(",".join(cols))
+        out_path.write_text("\n".join(buf) + "\n", encoding="utf-8")
+    else:
+        payload = [dict(r) for r in rows]
+        out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=1),
+                            encoding="utf-8")
+    print(f"audit: exported {len(rows)} entries -> {out_path}")
+
+
 def cmd_sync(con, a):
     """Pull the organization's master rules from the dashboard and upsert
     them locally. Skeleton for now: the fetch/upsert body lands in a later
@@ -491,7 +554,8 @@ def main():
     l.add_argument("--not-injected", action="store_true")
     sub.add_parser("export-md")
     sub.add_parser("export-index")
-    sub.add_parser("sync")  # enterprise dashboard pull (skeleton; Phase 3)
+    au = sub.add_parser("audit"); au.add_argument("--format", choices=["csv", "json"], default="csv"); au.add_argument("--out")
+    s = sub.add_parser("sync")  # enterprise dashboard pull (skeleton; Phase 3)
     args = p.parse_args()
     con = connect()
     init_db(con)
@@ -506,6 +570,7 @@ def main():
      "log": lambda: cmd_log(con, args),
      "export-md": lambda: cmd_export_md(con),
      "export-index": lambda: cmd_export_index(con),
+     "audit": lambda: cmd_audit(con, args),
      "sync": lambda: cmd_sync(con, args)}[args.cmd]()
 
 

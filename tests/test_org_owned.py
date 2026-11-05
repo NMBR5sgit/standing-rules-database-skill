@@ -94,7 +94,7 @@ class OrgOwnedTest(unittest.TestCase):
         self.assertIn("owner", cols)
         v = con3.execute("SELECT MAX(v) FROM schema_version").fetchone()[0]
         self.assertEqual(v, rules_db.SCHEMA_VERSION)
-        self.assertEqual(v, 3)
+        self.assertGreaterEqual(v, 3)
         row = con3.execute(
             "SELECT owner FROM rules WHERE rule_id='SR-950'").fetchone()
         self.assertEqual(row["owner"], "local",

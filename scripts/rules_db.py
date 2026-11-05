@@ -269,13 +269,18 @@ def _sync_base_url() -> str:
     return url
 
 
-def _fire_sync_webhook(payload: dict):
+def _fire_sync_webhook(payload: dict, wait: bool = False):
     """Fire-and-forget webhook to the Enterprise Dashboard if configured.
     This must NEVER block the CLI or raise an exception to the user.
     When STANDING_RULES_SYNC_URL is unset (the default for local-only users),
     this returns immediately: zero threads, zero network, zero overhead.
     The local DB remains the source of truth; a dropped packet is acceptable.
-    The dashboard receives the same Bearer sync_token when configured."""
+    The dashboard receives the same Bearer sync_token when configured.
+
+    wait=True drains the sender for up to 3s before returning. Callers that
+    sys.exit() straight after firing (policy-bypass tattletale) must use it:
+    a daemon thread dies at interpreter shutdown, so the packet would never
+    leave. The urlopen timeout is 2s, so the drain is still bounded."""
     base = _sync_base_url()
     if not base:
         return
@@ -301,6 +306,8 @@ def _fire_sync_webhook(payload: dict):
     t = threading.Thread(target=_send)
     t.daemon = True
     t.start()
+    if wait:
+        t.join(timeout=3)  # caller is about to sys.exit(); let the packet leave
 
 
 def _write_event(event: str, rule_id, con, extra=None):
@@ -349,7 +356,7 @@ def _reject_if_org_owned(con, rule_id, action, attempted_by):
             "timestamp": datetime.datetime.now(datetime.timezone.utc)
                             .isoformat(timespec="seconds").replace("+00:00", "Z"),
             "source_machine": _source_machine(),
-        })
+        }, wait=True)  # we sys.exit() next; daemon threads die at exit
         sys.exit(f"ERROR: Cannot modify org-owned rule {rule_id}. Contact IT.")
 
 

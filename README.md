@@ -10,13 +10,15 @@ Agents that follow standing rules usually inject every rule into every prompt. T
 
 ## How it works
 
-**Storage:** SQLite (`rules.db`) is the authoritative store — tables `rules`, `rule_versions`, `facts`, `usage_log` — with a query script (`scripts/rules_db.py`) supporting add / update (auto-versioning) / status / query / facts / log / export-md. Markdown files under `references/` are generated *views* for human reading, regenerated from the DB — never hand-edited. A structured store parses and queries far faster and more reliably than scanning prose files, and duplicate IDs are rejected by the database itself.
+**Storage:** SQLite (`rules.db`) is the authoritative store — tables `rules`, `rule_versions`, `facts`, `usage_log`, `schema_version` — with a query script (`scripts/rules_db.py`) supporting add / update (auto-versioning) / status / query / facts / log / export-md / export-index. Markdown files under `references/` are generated *views* for human reading, regenerated from the DB — never hand-edited. A structured store parses and queries far faster and more reliably than scanning prose files, and duplicate IDs are rejected by the database itself.
 
 ### Two tiers
 
 1. **Tier 1 (mandatory, deterministic).** A small set of rules that must apply to *every* job lives in the agent's always-injected memory (memory file, pinned system prompt section — whatever your agent supports). Loaded by construction, never dependent on a lookup. This is the anti-semantic-search guarantee: the rules you cannot afford to miss are never "retrieved," they are simply always there.
 
 2. **Tier 2 (conditional, fetched).** Everything else lives in the database behind a **dispatch index** in SKILL.md. Before starting a task, the agent queries `rules_db.py query --match "<keywords>"`, which returns tier-1 rules plus only the keyword-matched tier-2 rules. The full rule text reaches context only for jobs that need it.
+
+**Single source of truth:** The matching logic is centralized in a single `query_rules` function. Both the manual CLI (`rules_db.py query`) and the automatic per-turn agent consult hook (`standing_rules_consult.py`) call this exact same function. This guarantees that the CLI and the live agent runtime never drift in their recall semantics.
 
 ### Two kinds of triggers
 
@@ -59,13 +61,19 @@ If mandatory rules plus matched rules don't fit the context budget, the agent re
 The design grows the rule count from "what fits in a prompt" (~15–30) to "what fits in a consultable index" — realistically **hundreds of rules**, bounded by:
 
 - **The dispatch index must stay cheap.** One line per domain. Growth means deeper files, not more index rows.
-- **Retrieval is keyword-driven.** A rule whose trigger wording doesn't overlap the job's wording can be missed. Mitigations: broad trigger phrasing, "when in doubt query both domains," and cross-referencing from task skills. This is the price of context thrift — and why mandatory rules never depend on retrieval.
+- **Retrieval is keyword-driven.** The matcher uses token-set intersection and whole-token prefix containment (e.g. `deploy` matches `deployment`), but it does not understand semantics. A rule whose trigger wording doesn't overlap the job's wording can be missed. Mitigations: broad trigger phrasing, "when in doubt query both domains," and cross-referencing from task skills. This is the price of context thrift — and why mandatory rules never depend on retrieval.
 - **Tier 1 has a hard budget.** The always-injected set must stay small (single-digit rules). Everything else must have a recognizable trigger.
 - **Conflict handling is manual.** Fine at human scale; frequent conflicts are a signal to graduate to structured precedence.
 
-## Performance
+## Measured Performance
 
-Measured on a 31-rule database: a full `query --match` (tier-1 fetch + keyword match + priority sort) completes in **~0.09 s**, and five consecutive queries run in **0.45 s** wall time — Python interpreter startup dominates; the SQLite lookup itself is sub-millisecond. Rule count growth to hundreds of rules does not change per-job context cost, only the (still trivial) query time.
+Real-world measurements on a 38-rule database (7 tier-1, 31 tier-2) show the structural advantage of this design:
+
+- **Broad queries** (e.g., "outbound email") load ~51% of the database, saving roughly half the context space.
+- **Focused queries** (e.g., "deployment pipeline" or "gpu server") load ~147 words out of 925 total. Because the ~120-word tier-1 floor is mandatory, the *tier-2 payload* is only ~27 words (under 3% of the database), yielding an ~85% context reduction on the query-specific rules.
+- **Empty/no-match queries** load only tier-1, yielding an **~87% context reduction**.
+
+Query latency for the matching loop is **~0.39 ms** (average over 100 warm `query_rules` runs per query on the live database; per-query averages ranged 0.37–0.42 ms). Python interpreter startup dominates the CLI execution time. Rule count growth to hundreds of rules does not change per-job context cost, only the (still trivial) query time.
 
 ## Quick start
 

@@ -269,6 +269,13 @@ def _sync_base_url() -> str:
     return url
 
 
+# Explicit UA on every outbound request: Cloudflare-protected license servers
+# block the default "Python-urllib" UA with error 1010 (HTTP 403), which
+# looks like a token failure. A named client UA passes the WAF.
+USER_AGENT = ("StandingRulesEngine/1.0 "
+              "(+https://github.com/NMBR5sgit/standing-rules-database-skill)")
+
+
 def _fire_sync_webhook(payload: dict, wait: bool = False):
     """Fire-and-forget webhook to the Enterprise Dashboard if configured.
     This must NEVER block the CLI or raise an exception to the user.
@@ -284,7 +291,7 @@ def _fire_sync_webhook(payload: dict, wait: bool = False):
     base = _sync_base_url()
     if not base:
         return
-    headers = {"Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json", "User-Agent": USER_AGENT}
     token = os.environ.get("STANDING_RULES_SYNC_TOKEN")
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -659,7 +666,8 @@ def cmd_sync(con, a):
     try:
         req = urllib.request.Request(
             fetch_url, method="GET",
-            headers={"Authorization": f"Bearer {token}"})
+            headers={"Authorization": f"Bearer {token}",
+                     "User-Agent": USER_AGENT})
         with urllib.request.urlopen(req, timeout=5) as resp:
             body = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:

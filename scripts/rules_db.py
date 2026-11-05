@@ -114,7 +114,7 @@ def connect():
     return con
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def init_db(con):
@@ -128,6 +128,7 @@ def init_db(con):
       domain TEXT,
       priority TEXT NOT NULL DEFAULT 'MED',     -- HIGH | MED | LOW
       status TEXT NOT NULL DEFAULT 'active',    -- active | disabled | deprecated
+      owner TEXT NOT NULL DEFAULT 'local',      -- local | org (org-owned = immutable locally)
       tags TEXT,
       created_at TEXT, updated_at TEXT, effective_from TEXT
     );
@@ -151,6 +152,11 @@ def init_db(con):
     CREATE INDEX IF NOT EXISTS idx_rules_domain ON rules(domain);
     CREATE INDEX IF NOT EXISTS idx_rules_status ON rules(status);
     CREATE TABLE IF NOT EXISTS schema_version(v INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS conflict_log(
+      conflict_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      rule_id TEXT, action TEXT, attempted_by TEXT,
+      detail TEXT, created_at TEXT
+    );
     """)
     con.commit()
     _migrate(con)
@@ -165,13 +171,17 @@ def _migrate(con):
     if current >= SCHEMA_VERSION:
         return
     # Future migrations go here, guarded by PRAGMA table_info checks.
-    # (Existing v1→v2 migration body unchanged.)
     if current < 2:
         cols = {r["name"] for r in con.execute("PRAGMA table_info(facts)")}
         if "fact_key" not in cols:
             con.execute("ALTER TABLE facts ADD COLUMN fact_key TEXT")
         if "fact_value" not in cols:
             con.execute("ALTER TABLE facts ADD COLUMN fact_value TEXT")
+    if current < 3:
+        cols = {r["name"] for r in con.execute("PRAGMA table_info(rules)")}
+        if "owner" not in cols:
+            con.execute("ALTER TABLE rules ADD COLUMN owner TEXT NOT NULL "
+                        "DEFAULT 'local'")
     # Persist the new version. Always UPDATE if a row exists, INSERT otherwise.
     if con.execute("SELECT 1 FROM schema_version LIMIT 1").fetchone():
         con.execute("UPDATE schema_version SET v=?", (SCHEMA_VERSION,))
@@ -217,39 +227,74 @@ def _write_event(event: str, rule_id, con, extra=None):
         data = dict(row) if row else None
     if extra:
         data = {**(data or {}), **extra}
-    try:
-        host = os.environ.get("COMPUTERNAME") or os.uname().nodename
-    except AttributeError:
-        host = "unknown"
     return {
         "event": event,
         "rule_id": rule_id,
         "data": data,
         "timestamp": datetime.datetime.now(datetime.timezone.utc)
                         .isoformat(timespec="seconds").replace("+00:00", "Z"),
-        "source_machine": host,
+        "source_machine": _source_machine(),
     }
 
 
-def upsert_rule(con, r):
-    cur = con.execute("SELECT 1 FROM rules WHERE rule_id=?", (r["id"],))
-    if cur.fetchone():
+def _reject_if_org_owned(con, rule_id, action, attempted_by):
+    """Hard enforcement (Enterprise PRD §2.3): org-owned rules are immutable
+    on the local machine — the dashboard is their source of truth.
+    The rejection is NOT silent: it lands in conflict_log and fires a
+    webhook so IT sees who is trying to bypass policy. Then the CLI exits."""
+    row = con.execute("SELECT owner FROM rules WHERE rule_id=?", (rule_id,)).fetchone()
+    if row and row["owner"] == "org":
         con.execute(
-            "UPDATE rules SET name=?,text=?,summary=?,tier=?,domain=?,priority=?,tags=?,updated_at=? WHERE rule_id=?",
+            "INSERT INTO conflict_log(rule_id,action,attempted_by,detail,created_at) "
+            "VALUES(?,?,?,?,?)",
+            (rule_id, action, attempted_by,
+             "local CLI attempted to modify an org-owned rule", now()))
+        con.commit()
+        _fire_sync_webhook({
+            "event": "policy_bypass_attempt",
+            "rule_id": rule_id,
+            "data": {"action": action, "attempted_by": attempted_by},
+            "timestamp": datetime.datetime.now(datetime.timezone.utc)
+                            .isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "source_machine": _source_machine(),
+        })
+        sys.exit(f"ERROR: Cannot modify org-owned rule {rule_id}. Contact IT.")
+
+
+def _source_machine():
+    try:
+        return os.environ.get("COMPUTERNAME") or os.uname().nodename
+    except AttributeError:
+        return "unknown"
+
+
+def upsert_rule(con, r):
+    cur = con.execute("SELECT owner FROM rules WHERE rule_id=?", (r["id"],))
+    row = cur.fetchone()
+    if row:
+        if row[0] == "org" and not r.get("_org_write"):
+            # Org-owned rows are immutable locally; seed/add must not
+            # silently overwrite a rule the dashboard owns.
+            return False
+        con.execute(
+            "UPDATE rules SET name=?,text=?,summary=?,tier=?,domain=?,priority=?,tags=?,owner=?,updated_at=? WHERE rule_id=?",
             (r["name"], r["text"], r.get("summary"), r.get("tier", 2), r.get("domain"),
-             r.get("priority", "MED"), r.get("tags"), now(), r["id"]))
+             r.get("priority", "MED"), r.get("tags"), r.get("owner", "local"), now(), r["id"]))
     else:
         con.execute(
-            "INSERT INTO rules(rule_id,name,text,summary,tier,domain,priority,status,tags,created_at,updated_at,effective_from) VALUES(?,?,?,?,?,?,?,'active',?,?,?,?)",
+            "INSERT INTO rules(rule_id,name,text,summary,tier,domain,priority,status,tags,owner,created_at,updated_at,effective_from) VALUES(?,?,?,?,?,?,?,'active',?,?,?,?,?)",
             (r["id"], r["name"], r["text"], r.get("summary"), r.get("tier", 2), r.get("domain"),
-             r.get("priority", "MED"), r.get("tags"), now(), now(), r.get("effective_from", now())))
+             r.get("priority", "MED"), r.get("tags"), r.get("owner", "local"), now(), now(), r.get("effective_from", now())))
+    return True
 
 
 def cmd_seed(con, path):
     data = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
     rules_count = len(data.get("rules", []))
+    rules_skipped = 0
     for r in data.get("rules", []):
-        upsert_rule(con, r)
+        if not upsert_rule(con, r):
+            rules_skipped += 1
     facts_inserted = 0
     facts_skipped = 0
     for f in data.get("facts", []):
@@ -269,7 +314,8 @@ def cmd_seed(con, path):
             facts_inserted += 1
     con.commit()
     print(f"seeded {rules_count} rules, inserted {facts_inserted} facts, "
-          f"skipped {facts_skipped} duplicate facts")
+          f"skipped {facts_skipped} duplicate facts"
+          + (f", {rules_skipped} org-owned rules left untouched" if rules_skipped else ""))
     # Seed is bulk: one aggregate event instead of one webhook per rule
     # (a 5000-candidate seed must not spawn a thread storm).
     _fire_sync_webhook(_write_event(
@@ -284,7 +330,8 @@ def cmd_add(con, a):
     if dup:
         sys.exit(f"DUPLICATE: {a.id} already exists — use update instead")
     upsert_rule(con, {"id": a.id, "name": a.name, "text": a.text, "summary": a.summary,
-                      "tier": a.tier, "domain": a.domain, "priority": a.priority, "tags": a.tags})
+                      "tier": a.tier, "domain": a.domain, "priority": a.priority,
+                      "tags": a.tags, "owner": getattr(a, "owner", "local")})
     con.commit()
     print(f"added {a.id}")
     _fire_sync_webhook(_write_event("rule_added", a.id, con))
@@ -294,6 +341,7 @@ def cmd_update(con, a):
     row = con.execute("SELECT * FROM rules WHERE rule_id=?", (a.id,)).fetchone()
     if not row:
         sys.exit(f"not found: {a.id}")
+    _reject_if_org_owned(con, a.id, "update", a.by)
     v = con.execute("SELECT COALESCE(MAX(version_number),0)+1 FROM rule_versions WHERE rule_id=?",
                     (a.id,)).fetchone()[0]
     con.execute("INSERT INTO rule_versions(rule_id,version_number,name,text,priority,status,change_reason,changed_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
@@ -306,6 +354,7 @@ def cmd_update(con, a):
 
 
 def cmd_status(con, a):
+    _reject_if_org_owned(con, a.id, "status", a.reason or "user")
     con.execute("UPDATE rules SET status=?, updated_at=? WHERE rule_id=?", (a.state, now(), a.id))
     con.commit()
     print(f"{a.id} -> {a.state} ({a.reason})")
@@ -417,6 +466,7 @@ def main():
     a = sub.add_parser("add"); a.add_argument("--id", required=True); a.add_argument("--name", required=True)
     a.add_argument("--text", required=True); a.add_argument("--summary"); a.add_argument("--tier", type=int, default=2)
     a.add_argument("--domain"); a.add_argument("--priority", default="MED"); a.add_argument("--tags")
+    a.add_argument("--owner", choices=["local", "org"], default="local")
     u = sub.add_parser("update"); u.add_argument("id"); u.add_argument("--text", required=True)
     u.add_argument("--reason", required=True); u.add_argument("--by", default="user")
     u.add_argument("--priority")

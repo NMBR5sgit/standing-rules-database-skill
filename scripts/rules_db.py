@@ -166,7 +166,7 @@ def connect():
     return con
 
 
-SCHEMA_VERSION = 5   # v4: audit_log; v5: engine_state (kill-switch lockdown)
+SCHEMA_VERSION = 6   # v5: engine_state; v6: query_telemetry (batched analytics)
 
 
 def init_db(con):
@@ -203,6 +203,11 @@ def init_db(con):
     );
     CREATE INDEX IF NOT EXISTS idx_rules_domain ON rules(domain);
     CREATE INDEX IF NOT EXISTS idx_rules_status ON rules(status);
+    CREATE TABLE IF NOT EXISTS query_telemetry(
+      q_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts TEXT NOT NULL, match_str TEXT NOT NULL,
+      matched_ids TEXT NOT NULL, match_count INTEGER NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS schema_version(v INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS conflict_log(
       conflict_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -469,6 +474,7 @@ def cmd_status(con, a):
 
 def cmd_query(con, a):
     rows = query_rules(con, a.match)
+    _record_query_telemetry(con, a.match, rows)
     t1 = [r for r in rows if r["tier"] == 1]
     matched = [r for r in rows if r["tier"] != 1]
     if a.json:
@@ -575,6 +581,41 @@ def cmd_audit(con, a):
         out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=1),
                             encoding="utf-8")
     print(f"audit: exported {len(rows)} entries -> {out_path}")
+
+
+TELEMETRY_BATCH_SIZE = 20
+
+
+def _record_query_telemetry(con, match_str, rows):
+    """Batched query analytics (PRD §2.4 'which rules are actually being used').
+    URL-gated: with STANDING_RULES_SYNC_URL unset this is a no-op — zero
+    writes, zero threads, the hot query path stays untouched. With it set,
+    each query appends one local row; every TELEMETRY_BATCH_SIZE queries are
+    flushed to the dashboard as ONE webhook event (no per-query packets)."""
+    if not os.environ.get("STANDING_RULES_SYNC_URL"):
+        return
+    ids = ",".join(r["rule_id"] for r in rows)
+    con.execute(
+        "INSERT INTO query_telemetry(ts,match_str,matched_ids,match_count) "
+        "VALUES(?,?,?,?)", (now(), match_str, ids, len(rows)))
+    con.commit()
+    pending = con.execute("SELECT COUNT(*) FROM query_telemetry").fetchone()[0]
+    if pending < TELEMETRY_BATCH_SIZE:
+        return
+    batch = con.execute(
+        "SELECT q_id,ts,match_str,matched_ids,match_count FROM query_telemetry "
+        "ORDER BY q_id LIMIT ?", (TELEMETRY_BATCH_SIZE,)).fetchall()
+    con.execute(
+        "DELETE FROM query_telemetry WHERE q_id<=?", (batch[-1]["q_id"],))
+    con.commit()
+    _fire_sync_webhook({
+        "event": "query_telemetry_batch",
+        "rule_id": None,
+        "data": {"queries": [dict(b) for b in batch], "batch_size": len(batch)},
+        "timestamp": datetime.datetime.now(datetime.timezone.utc)
+                        .isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "source_machine": _source_machine(),
+    })
 
 
 def cmd_sync(con, a):

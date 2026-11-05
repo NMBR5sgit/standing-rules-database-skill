@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Tests (Dashboard sprint, Commit 4): sync fetch body (mock HTTP).
+"""Tests (Dashboard sprint, Commit 4 + Commit 8): sync fetch body (mock HTTP).
 
-GET <STANDING_RULES_SYNC_URL>/rules.json -> upsert org-owned rules locally
+GET <STANDING_RULES_SYNC_URL>/sync/pull with Authorization: Bearer
+<STANDING_RULES_SYNC_TOKEN> -> upsert org-owned rules locally
 (override allowed for org-owned rows, blocked for local-owned rows),
-deprecate withdrawn org rules, never delete, fail clean when the dashboard
-is unreachable. Mocked urlopen only — no real network in tests.
+deprecate withdrawn org rules, never delete, fail clean when the server
+is unreachable, exit clean on 401 and on a missing token. SYNC_URL is the
+BASE url; a supplied URL already ending in /sync/pull is stripped.
+Mocked urlopen only — no real network in tests.
 """
 import io
 import json
@@ -50,11 +53,13 @@ class SyncFetchTest(unittest.TestCase):
         self.con = rules_db.connect()
         rules_db.init_db(self.con)
         rules_db.os.environ["STANDING_RULES_SYNC_URL"] = "http://dashboard.invalid"
+        rules_db.os.environ["STANDING_RULES_SYNC_TOKEN"] = "test-token"
         self._orig_urlopen = urllib.request.urlopen
         self._saved_req = rules_db.urllib.request.Request
 
     def tearDown(self):
         rules_db.os.environ.pop("STANDING_RULES_SYNC_URL", None)
+        rules_db.os.environ.pop("STANDING_RULES_SYNC_TOKEN", None)
         rules_db.urllib.request.urlopen = self._orig_urlopen
         self.con.close()
         self.tmp.cleanup()
@@ -64,6 +69,7 @@ class SyncFetchTest(unittest.TestCase):
 
         def fake_urlopen(req, timeout=None):
             fake_urlopen.last_url = req.full_url
+            fake_urlopen.last_auth = req.headers.get("Authorization")
             return _FakeResp(body)
 
         rules_db.urllib.request.urlopen = fake_urlopen
@@ -99,7 +105,8 @@ class SyncFetchTest(unittest.TestCase):
         fake = self._serve(payload)
         out = self._sync()
         self.assertIn("2 org rules applied", out)
-        self.assertEqual(fake.last_url, "http://dashboard.invalid/rules.json")
+        self.assertEqual(fake.last_url, "http://dashboard.invalid/sync/pull")
+        self.assertEqual(fake.last_auth, "Bearer test-token")
         r1 = self._get("SR-ORG1")
         self.assertEqual(r1["owner"], "org")
         self.assertEqual(r1["tier"], 1)
@@ -202,6 +209,43 @@ class SyncFetchTest(unittest.TestCase):
                 self._sync()
         self.assertIn("dashboard fetch failed", str(cm.exception.code))
         self.assertIn("source of truth", str(cm.exception.code))
+
+    # ---- Commit 8: token + base-URL contract --------------------------------
+
+    def test_sync_missing_token_exits_with_clear_error(self):
+        rules_db.os.environ.pop("STANDING_RULES_SYNC_TOKEN", None)
+        with self.assertRaises(SystemExit) as cm:
+            self._sync()
+        self.assertIn("SYNC_URL is set, but SYNC_TOKEN is missing",
+                      str(cm.exception.code))
+
+    def test_sync_401_exits_gracefully_no_stack_trace(self):
+        def deny(req, timeout=None):
+            raise urllib.error.HTTPError(
+                req.full_url, 401, "Unauthorized", {}, None)
+
+        rules_db.urllib.request.urlopen = deny
+        with self.assertRaises(SystemExit) as cm:
+            self._sync()
+        msg = str(cm.exception.code)
+        self.assertIn("401", msg)
+        self.assertIn("STANDING_RULES_SYNC_TOKEN", msg)
+        self.assertIn("source of truth", msg)
+
+    def test_sync_url_ending_in_sync_pull_is_stripped(self):
+        rules_db.os.environ["STANDING_RULES_SYNC_URL"] = \
+            "http://dashboard.invalid/sync/pull"
+        fake = self._serve({"rules": []})
+        out = self._sync()
+        self.assertEqual(fake.last_url, "http://dashboard.invalid/sync/pull",
+                         "no double /sync/pull/sync/pull path")
+
+    def test_sync_url_with_trailing_slash_is_normalized(self):
+        rules_db.os.environ["STANDING_RULES_SYNC_URL"] = \
+            "http://dashboard.invalid/"
+        fake = self._serve({"rules": []})
+        self._sync()
+        self.assertEqual(fake.last_url, "http://dashboard.invalid/sync/pull")
 
     def test_bad_payload_applies_nothing(self):
         self._serve(b'{"unexpected": 1}')

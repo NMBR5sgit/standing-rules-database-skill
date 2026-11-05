@@ -55,6 +55,7 @@ class LockdownTest(unittest.TestCase):
     def tearDown(self):
         rules_db.urllib.request.urlopen = self._orig_urlopen
         rules_db.os.environ.pop("STANDING_RULES_SYNC_URL", None)
+        rules_db.os.environ.pop("STANDING_RULES_SYNC_TOKEN", None)
         self.con.close()
         self.tmp.cleanup()
 
@@ -88,6 +89,7 @@ class LockdownTest(unittest.TestCase):
 
     def test_sync_payload_updates_engine_state_directly(self):
         rules_db.os.environ["STANDING_RULES_SYNC_URL"] = "http://dashboard.invalid"
+        rules_db.os.environ["STANDING_RULES_SYNC_TOKEN"] = "test-token"
         self._serve({"rules": [], "lockdown": {
             "active": True, "reason": "prompt injection wave",
             "issued_by": "it.lead@corp"}})
@@ -149,6 +151,7 @@ class LockdownTest(unittest.TestCase):
 
     def test_sync_still_works_during_lockdown_and_lifts_it(self):
         rules_db.os.environ["STANDING_RULES_SYNC_URL"] = "http://dashboard.invalid"
+        rules_db.os.environ["STANDING_RULES_SYNC_TOKEN"] = "test-token"
         rules_db.set_lockdown(self.con, {"active": True, "reason": "incident"})
         # sync is how IT lifts the freeze
         self._serve({"rules": [], "lockdown": {"active": False}})

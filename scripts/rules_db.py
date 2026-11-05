@@ -23,6 +23,7 @@ import argparse, json, re, sqlite3, sys, datetime, pathlib
 import os
 import threading
 import urllib.request
+import urllib.error
 
 SKILL_DIR = pathlib.Path(__file__).resolve().parent.parent
 DB_PATH = SKILL_DIR / "rules.db"
@@ -256,22 +257,39 @@ def _migrate(con):
     con.commit()
 
 
+def _sync_base_url() -> str:
+    """STANDING_RULES_SYNC_URL is the server BASE url (e.g.
+    https://api.example.com). The sync pull endpoint is appended internally.
+    A URL that already ends in a known endpoint path is stripped so we never
+    build double paths (https://api.example.com/sync/pull works too)."""
+    url = os.environ.get("STANDING_RULES_SYNC_URL", "").rstrip("/")
+    for suffix in ("/sync/pull", "/rules.json"):
+        if url.endswith(suffix):
+            url = url[: -len(suffix)].rstrip("/")
+    return url
+
+
 def _fire_sync_webhook(payload: dict):
     """Fire-and-forget webhook to the Enterprise Dashboard if configured.
     This must NEVER block the CLI or raise an exception to the user.
     When STANDING_RULES_SYNC_URL is unset (the default for local-only users),
     this returns immediately: zero threads, zero network, zero overhead.
-    The local DB remains the source of truth; a dropped packet is acceptable."""
-    url = os.environ.get("STANDING_RULES_SYNC_URL")
-    if not url:
+    The local DB remains the source of truth; a dropped packet is acceptable.
+    The dashboard receives the same Bearer sync_token when configured."""
+    base = _sync_base_url()
+    if not base:
         return
+    headers = {"Content-Type": "application/json"}
+    token = os.environ.get("STANDING_RULES_SYNC_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
 
     def _send():
         try:
             req = urllib.request.Request(
-                url,
+                base.rstrip("/") + "/events",
                 data=json.dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
+                headers=headers,
                 method="POST",
             )
             # 2-second timeout max. If the dashboard is slow, we drop the packet.
@@ -619,17 +637,31 @@ def _record_query_telemetry(con, match_str, rows):
 
 
 def cmd_sync(con, a):
-    """Pull the organization's master rules from the dashboard and upsert
-    them locally. The local DB stays the source of truth; the dashboard is
-    a sync target, not an API the agent depends on."""
+    """Pull the organization's master rules from the license server and
+    upsert them locally. The local DB stays the source of truth; the server
+    is a sync target, not an API the agent depends on.
+    STANDING_RULES_SYNC_URL is the base URL; /sync/pull is appended
+    internally. STANDING_RULES_SYNC_TOKEN authenticates the pull."""
     url = os.environ.get("STANDING_RULES_SYNC_URL")
     if not url:
         sys.exit("ERROR: STANDING_RULES_SYNC_URL is not set. Sync is disabled.")
-    fetch_url = url.rstrip("/") + "/rules.json"
+    token = os.environ.get("STANDING_RULES_SYNC_TOKEN")
+    if not token:
+        sys.exit("ERROR: SYNC_URL is set, but SYNC_TOKEN is missing.")
+    fetch_url = _sync_base_url() + "/sync/pull"
     try:
-        req = urllib.request.Request(fetch_url, method="GET")
+        req = urllib.request.Request(
+            fetch_url, method="GET",
+            headers={"Authorization": f"Bearer {token}"})
         with urllib.request.urlopen(req, timeout=5) as resp:
             body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            sys.exit("sync: license server rejected the sync token (401 "
+                     "Unauthorized). Check STANDING_RULES_SYNC_TOKEN; "
+                     "local rules.db remains the source of truth")
+        sys.exit(f"sync: dashboard fetch failed (HTTP {e.code}: {e.reason}); "
+                 "local rules.db remains the source of truth")
     except Exception as e:
         sys.exit(f"sync: dashboard fetch failed ({type(e).__name__}: {e}); "
                  "local rules.db remains the source of truth")

@@ -104,7 +104,7 @@ class SyncHookTest(unittest.TestCase):
         finally:
             rules_db.urllib.request.urlopen = orig
         self.assertTrue(sent, "webhook POST never issued for configured URL")
-        self.assertEqual(captured["url"], "http://dashboard.invalid/webhook")
+        self.assertEqual(captured["url"], "http://dashboard.invalid/webhook/events", "SYNC_URL is the base; the CLI appends /events")
         self.assertEqual(captured["method"], "POST")
         self.assertEqual(captured["content_type"], "application/json")
         self.assertEqual(captured["timeout"], 2)

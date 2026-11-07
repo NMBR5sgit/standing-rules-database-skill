@@ -663,8 +663,14 @@ def cmd_sync(con, a):
     if not token:
         sys.exit("ERROR: SYNC_URL is set, but SYNC_TOKEN is missing.")
     fetch_url = _sync_base_url() + "/sync/pull"
-    # Optional corporate domain for key-sharing detection (paid tenants only)
+    # Optional corporate domain for key-sharing detection (paid tenants only).
+    # Normalize: lowercase + strip trailing dot (legal in DNS, but the dashboard
+    # stores the domain without it). Defense in depth: both sides normalize.
     corporate_domain = os.environ.get("STANDING_RULES_CORPORATE_DOMAIN")
+    if corporate_domain:
+        corporate_domain = corporate_domain.lower().strip()
+        if corporate_domain.endswith('.'):
+            corporate_domain = corporate_domain[:-1]
     sync_headers = {"Authorization": f"Bearer {token}",
                    "User-Agent": USER_AGENT}
     if corporate_domain:
@@ -680,6 +686,11 @@ def cmd_sync(con, a):
             sys.exit("sync: license server rejected the sync token (401 "
                      "Unauthorized). Check STANDING_RULES_SYNC_TOKEN; "
                      "local rules.db remains the source of truth")
+        if e.code == 403:
+            # Seat limit exceeded — contact admin to add seats
+            sys.exit(f"sync: seat limit exceeded (HTTP 403: {e.reason}); "
+                     "contact your admin to add seats. "
+                     "Local rules.db remains the source of truth")
         sys.exit(f"sync: dashboard fetch failed (HTTP {e.code}: {e.reason}); "
                  "local rules.db remains the source of truth")
     except Exception as e:
@@ -717,6 +728,8 @@ def cmd_sync(con, a):
     # org-owned rules to rule_versions, then DELETE them. owner='local'
     # rules are never touched by a wipe.
     wipe_applied = body.get("action") == "wipe_org_rules"
+    wipe_reason = body.get("reason", "wipe_org_rules")
+    delinquency_stage = body.get("delinquency_stage")
     wiped = 0
     if wipe_applied:
         for row in con.execute("SELECT * FROM rules WHERE owner='org'").fetchall():
@@ -728,7 +741,7 @@ def cmd_sync(con, a):
                 "priority,status,change_reason,changed_by,created_at) "
                 "VALUES(?,?,?,?,?,?,?,?,?)",
                 (row["rule_id"], v, row["name"], row["text"], row["priority"],
-                 "revoked", "wipe_org_rules", "sync", now()))
+                 "revoked", wipe_reason, "sync", now()))
             con.execute("DELETE FROM rules WHERE rule_id=?", (row["rule_id"],))
             _audit(con, "sync", "WIPED", row["rule_id"], row, None)
             wiped += 1
@@ -759,11 +772,17 @@ def cmd_sync(con, a):
     msg = f"sync: {applied} org rules applied"
     if wiped:
         msg += f", {wiped} org rules wiped"
+        if delinquency_stage:
+            msg += f" (delinquency: {delinquency_stage})"
     if withdrawn:
         msg += f", {withdrawn} withdrawn rules deprecated"
     if skipped_local:
         msg += f", {skipped_local} non-org entries skipped"
     msg += lockdown_note
+    if body.get("warning"):
+        msg += f" | WARNING: {body['warning']}"
+    if body.get("delinquency_stage") and not wiped:
+        msg += f" | DELINQUENCY: {body['delinquency_stage']}"
     print(msg)
 
 

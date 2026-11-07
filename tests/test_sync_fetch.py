@@ -70,6 +70,7 @@ class SyncFetchTest(unittest.TestCase):
         def fake_urlopen(req, timeout=None):
             fake_urlopen.last_url = req.full_url
             fake_urlopen.last_auth = req.headers.get("Authorization")
+            fake_urlopen.last_headers = dict(req.headers)
             return _FakeResp(body)
 
         rules_db.urllib.request.urlopen = fake_urlopen
@@ -264,6 +265,34 @@ class SyncFetchTest(unittest.TestCase):
         rows = self.con.execute(
             "SELECT action,actor FROM audit_log").fetchall()
         self.assertTrue(any(r["action"] == "SYNC" and r["actor"] == "sync" for r in rows))
+
+
+    def test_sync_sends_corporate_domain_header(self):
+        """Concern 3: X-Client-Domain header is sent when env var is set,
+        normalized to lowercase and stripped of trailing dot."""
+        rules_db.os.environ["STANDING_RULES_CORPORATE_DOMAIN"] = "Acme.COM."
+        fake = self._serve({"rules": []})
+        self._sync()
+        # urllib normalizes header names, so check case-insensitively
+        headers = {k.lower(): v for k, v in fake.last_headers.items()}
+        self.assertIn("x-client-domain", headers)
+        self.assertEqual(headers["x-client-domain"], "acme.com")
+
+    def test_sync_403_seat_limit_exceeded_message(self):
+        """Concern 7: 403 returns a seat-limit-specific message, not generic."""
+        def deny(req, timeout=None):
+            raise urllib.error.HTTPError(
+                req.full_url, 403, "Forbidden",
+                {}, None)
+
+        rules_db.urllib.request.urlopen = deny
+        with self.assertRaises(SystemExit) as cm:
+            self._sync()
+        msg = str(cm.exception.code)
+        self.assertIn("seat limit exceeded", msg)
+        self.assertIn("HTTP 403", msg)
+        self.assertIn("add seats", msg)
+        self.assertIn("source of truth", msg)
 
 
 if __name__ == "__main__":

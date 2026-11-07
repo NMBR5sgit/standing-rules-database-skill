@@ -663,11 +663,16 @@ def cmd_sync(con, a):
     if not token:
         sys.exit("ERROR: SYNC_URL is set, but SYNC_TOKEN is missing.")
     fetch_url = _sync_base_url() + "/sync/pull"
+    # Optional corporate domain for key-sharing detection (paid tenants only)
+    corporate_domain = os.environ.get("STANDING_RULES_CORPORATE_DOMAIN")
+    sync_headers = {"Authorization": f"Bearer {token}",
+                   "User-Agent": USER_AGENT}
+    if corporate_domain:
+        sync_headers["X-Client-Domain"] = corporate_domain
     try:
         req = urllib.request.Request(
             fetch_url, method="GET",
-            headers={"Authorization": f"Bearer {token}",
-                     "User-Agent": USER_AGENT})
+            headers=sync_headers)
         with urllib.request.urlopen(req, timeout=5) as resp:
             body = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:

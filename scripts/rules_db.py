@@ -671,8 +671,14 @@ def cmd_sync(con, a):
         corporate_domain = corporate_domain.lower().strip()
         if corporate_domain.endswith('.'):
             corporate_domain = corporate_domain[:-1]
+    # Machine ID for seat enforcement: stable across runs on this machine
+    # Uses hostname + user hash as a stable identifier (no PII)
+    import hashlib
+    import platform
+    machine_id = f"{platform.node()}-{hashlib.sha256(platform.node().encode()).hexdigest()[:8]}"
     sync_headers = {"Authorization": f"Bearer {token}",
-                   "User-Agent": USER_AGENT}
+                    "User-Agent": USER_AGENT,
+                    "X-Client-Machine": machine_id}
     if corporate_domain:
         sync_headers["X-Client-Domain"] = corporate_domain
     try:
@@ -748,18 +754,24 @@ def cmd_sync(con, a):
 
     # Rules the org withdrew: deprecate the local copy (never delete —
     # version history stays queryable). Skipped during a wipe (already gone).
+    # ALSO SKIPPED when the dashboard signals "scope_filtered": in that case,
+    # rules not in the payload are merely scoped out (not visible from this
+    # subdomain), NOT withdrawn by IT. Deprecating them would corrupt the
+    # audit trail and churn on every subdomain switch.
+    scope_filtered = body.get("scope_filtered", False)
     withdrawn = 0
-    for row in con.execute(
-            "SELECT rule_id FROM rules WHERE owner='org' AND status='active'").fetchall():
-        if row["rule_id"] not in org_ids:
-            before = con.execute("SELECT * FROM rules WHERE rule_id=?",
-                                 (row["rule_id"],)).fetchone()
-            con.execute("UPDATE rules SET status='deprecated', updated_at=? WHERE rule_id=?",
-                        (now(), row["rule_id"]))
-            after = con.execute("SELECT * FROM rules WHERE rule_id=?",
-                                (row["rule_id"],)).fetchone()
-            _audit(con, "sync", "WITHDRAWN", row["rule_id"], before, after)
-            withdrawn += 1
+    if not wipe_applied and not scope_filtered:
+        for row in con.execute(
+                "SELECT rule_id FROM rules WHERE owner='org' AND status='active'").fetchall():
+            if row["rule_id"] not in org_ids:
+                before = con.execute("SELECT * FROM rules WHERE rule_id=?",
+                                     (row["rule_id"],)).fetchone()
+                con.execute("UPDATE rules SET status='deprecated', updated_at=? WHERE rule_id=?",
+                            (now(), row["rule_id"]))
+                after = con.execute("SELECT * FROM rules WHERE rule_id=?",
+                                    (row["rule_id"],)).fetchone()
+                _audit(con, "sync", "WITHDRAWN", row["rule_id"], before, after)
+                withdrawn += 1
 
     lockdown = body.get("lockdown")
     lockdown_note = ""

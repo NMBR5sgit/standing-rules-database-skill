@@ -167,6 +167,43 @@ class SyncFetchTest(unittest.TestCase):
         self.assertIsNotNone(row, "withdrawn rule must not be deleted")
         self.assertEqual(row["status"], "deprecated")
 
+    def test_scope_filtered_skips_withdrawn_loop(self):
+        """Concern 8: When dashboard signals scope_filtered, rules not in the
+        payload are scoped out (not visible from this subdomain), NOT withdrawn
+        by IT. The core must skip the withdrawn-rule deprecation loop."""
+        # Seed two org rules locally
+        self._rule("SR-ORG-A", owner="org", text="policy A")
+        self._rule("SR-ORG-B", owner="org", text="policy B")
+
+        # Dashboard only returns SR-ORG-A (scope-filtered response)
+        # and signals scope_filtered=true
+        self._serve({
+            "rules": [{"id": "SR-ORG-A", "name": "policy A", "text": "policy A",
+                       "tier": 1, "domain": "engineering", "priority": "HIGH"}],
+            "scope_filtered": True,
+            "client_domain": "it.acme.com"
+        })
+        out = self._sync()
+
+        # Both rules should still be active — SR-ORG-B was scoped out, not withdrawn
+        self.assertIn("1 org rules applied", out)
+        self.assertNotIn("withdrawn rules deprecated", out)
+        row_a = self._get("SR-ORG-A")
+        row_b = self._get("SR-ORG-B")
+        self.assertEqual(row_a["status"], "active")
+        self.assertEqual(row_b["status"], "active",
+                         "scope-filtered rule must NOT be deprecated")
+
+    def test_without_scope_filtered_still_deprecates(self):
+        """Regression: without scope_filtered flag, the withdrawn loop
+        still fires (normal IT withdrawal behavior)."""
+        self._rule("SR-ORG-C", owner="org", text="policy C")
+        self._serve({"rules": [{"id": "SR-NEW", "name": "n", "text": "t",
+                                "tier": 2, "domain": "d", "priority": "MED"}]})
+        out = self._sync()
+        self.assertIn("1 withdrawn rules deprecated", out)
+        self.assertEqual(self._get("SR-ORG-C")["status"], "deprecated")
+
     def test_wipe_org_rules_payload_deletes_org_and_spares_local(self):
         """Explicit revocation directive from the dashboard:
         {"status": "revoked", "action": "wipe_org_rules"} deletes every
@@ -199,6 +236,61 @@ class SyncFetchTest(unittest.TestCase):
         actions = [r["action"] for r in self.con.execute(
             "SELECT action FROM audit_log ORDER BY audit_id").fetchall()]
         self.assertEqual(actions.count("WIPED"), 2)
+
+    def test_stage3_wipe_carries_reason_to_ledger(self):
+        """Stage 3 (Hard Pull): Dashboard sends delinquency reason;
+        core must ledger it in rule_versions.change_reason."""
+        self._rule("SR-ORG-D1", owner="org", text="delinquency rule 1")
+        self._rule("SR-ORG-D2", owner="org", text="delinquency rule 2")
+
+        payload = {
+            "status": "revoked",
+            "action": "wipe_org_rules",
+            "delinquency_stage": "hard_pull",
+            "reason": "delinquency - 7+ days past due",
+            "rules": []
+        }
+        self._serve(payload)
+        out = self._sync()
+        self.assertIn("2 org rules wiped", out)
+
+        # Verify reason propagated to rule_versions
+        snaps = self.con.execute(
+            "SELECT rule_id, status, change_reason FROM rule_versions "
+            "WHERE rule_id IN ('SR-ORG-D1','SR-ORG-D2')").fetchall()
+        self.assertEqual(len(snaps), 2)
+        for s in snaps:
+            self.assertEqual(s["status"], "revoked")
+            self.assertEqual(s["change_reason"], "delinquency - 7+ days past due",
+                             "Stage 3 reason must be ledgered, not defaulted")
+
+    def test_stage2_soft_freeze_serves_rules_no_deprecation(self):
+        """Stage 2 (Soft Freeze): Dashboard serves rules normally with warning
+        and delinquency_stage flag. Core must NOT deprecate rules that are
+        present in the payload."""
+        # Seed one org rule locally
+        self._rule("SR-ORG-S2", owner="org", text="soft freeze policy")
+
+        # Dashboard returns the same rule with Stage 2 metadata
+        payload = {
+            "rules": [{"id": "SR-ORG-S2", "name": "soft freeze policy",
+                       "text": "soft freeze policy", "tier": 2,
+                       "domain": "engineering", "priority": "HIGH"}],
+            "delinquency_stage": "soft_freeze",
+            "warning": "Payment overdue",
+            "freeze_mode": "read_only"
+        }
+        self._serve(payload)
+        out = self._sync()
+
+        # Rule should be active, not deprecated
+        row = self._get("SR-ORG-S2")
+        self.assertIsNotNone(row, "Stage 2 rule must still exist")
+        self.assertEqual(row["status"], "active",
+                         "Stage 2 must NOT deprecate served rules")
+        # No withdrawn rules deprecated (count should be 0)
+        self.assertNotIn("withdrawn rules deprecated", out)
+        self.assertIn("1 org rules applied", out)
 
     def test_sync_fetch_failure_exits_clean(self):
         def boom(req, timeout=None):

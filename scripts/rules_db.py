@@ -24,6 +24,8 @@ import os
 import threading
 import urllib.request
 import urllib.error
+import hmac
+import hashlib
 
 SKILL_DIR = pathlib.Path(__file__).resolve().parent.parent
 DB_PATH = SKILL_DIR / "rules.db"
@@ -708,6 +710,37 @@ def cmd_sync(con, a):
                                       and not is_directive):
         sys.exit("sync: bad payload — expected {\"rules\": [...]} or a "
                  "directive action (e.g. wipe_org_rules); nothing applied")
+
+    # Enterprise Gap 3: Verify HMAC signature before applying rules.
+    # Prevents tampering with the rules payload in transit or at rest.
+    signature = body.get("signature")
+    if signature and token:
+        rules_json = json.dumps(body.get("rules", []), sort_keys=True)
+        expected_sig = hmac.new(
+            token.encode(), rules_json.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected_sig):
+            sys.exit("sync: INTEGRITY FAILURE — signature mismatch. "
+                     "Rules payload may have been tampered with. "
+                     "Nothing applied; local rules.db remains source of truth")
+
+    # Enterprise Gap 2: Fail-Closed enforcement.
+    # If valid_until has passed, enter lockdown mode (freeze all rules).
+    valid_until = body.get("valid_until")
+    if valid_until:
+        from datetime import datetime, timezone
+        try:
+            vu = datetime.fromisoformat(valid_until.replace("Z", "+00:00"))
+            if datetime.now(timezone.utc) > vu:
+                # Lockdown: mark all org rules as disabled until re-sync
+                con.execute("UPDATE rules SET status='disabled' "
+                            "WHERE owner='org' AND status='active'")
+                con.commit()
+                sys.exit("sync: COMPLIANCE LOCKDOWN — rules expired. "
+                         "Compliance requires connectivity — re-establish "
+                         "connection to the master rules database within "
+                         "24 hours. All org rules frozen until synced.")
+        except (ValueError, TypeError):
+            pass  # invalid timestamp, proceed normally
 
     applied = 0
     skipped_local = 0

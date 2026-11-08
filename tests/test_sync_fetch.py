@@ -387,5 +387,252 @@ class SyncFetchTest(unittest.TestCase):
         self.assertIn("source of truth", msg)
 
 
+class OfflineStandaloneTest(unittest.TestCase):
+    """Enterprise features (HMAC signature, fail-closed lockdown, tier1_hash)
+    must have ZERO effect on users who have NOT set STANDING_RULES_SYNC_URL/
+    TOKEN. Standalone usage must behave exactly as before: all local rules
+    load normally, no network calls, no signature verification, no lockdown.
+
+    Also verifies the enterprise features themselves don't misfire:
+    - valid_until absent -> no lockdown (legacy payloads work)
+    - signature absent -> no verification (legacy payloads work)
+    - tier1_hash absent -> no attestation required
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        rules_db.DB_PATH = pathlib.Path(self.tmp.name) / "rules.db"
+        rules_db.REF_DIR = pathlib.Path(self.tmp.name) / "references"
+        self.con = rules_db.connect()
+        rules_db.init_db(self.con)
+        self._orig_urlopen = urllib.request.urlopen
+        # Ensure NO dashboard env vars
+        rules_db.os.environ.pop("STANDING_RULES_SYNC_URL", None)
+        rules_db.os.environ.pop("STANDING_RULES_SYNC_TOKEN", None)
+        rules_db.os.environ.pop("STANDING_RULES_CORPORATE_DOMAIN", None)
+
+    def tearDown(self):
+        rules_db.urllib.request.urlopen = self._orig_urlopen
+        self.con.close()
+        self.tmp.cleanup()
+
+    def _seed_local_rule(self, rule_id, text="my standalone rule"):
+        self.con.execute(
+            "INSERT INTO rules(rule_id,name,text,tier,domain,priority,status,owner,created_at,updated_at) "
+            "VALUES(?,?,?,2,'testing','MED','active','local',?,?)",
+            (rule_id, "personal", text,
+             rules_db.now(), rules_db.now()))
+        self.con.commit()
+
+    def test_standalone_user_query_works_without_dashboard_env(self):
+        """Core regression: query still works with no env vars set."""
+        self._seed_local_rule("SR-LOCAL-1", "tier 1 rule")
+        self._seed_local_rule("SR-LOCAL-2", "tier 2 rule")
+        args = _Args(match="tier", json=False)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rules_db.cmd_query(self.con, args)
+        result = out.getvalue()
+        self.assertIn("SR-LOCAL-1", result)
+        self.assertIn("SR-LOCAL-2", result)
+
+    def test_standalone_user_lockdown_command_works(self):
+        """lockdown command works without dashboard env."""
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rules_db.cmd_lockdown(self.con, _Args())
+        result = out.getvalue()
+        self.assertIn("lockdown", result.lower())
+
+    def test_sync_without_env_exits_with_clear_error(self):
+        """sync command without env vars exits cleanly with actionable error.
+        No signature check, no lockdown check, no tier1 attestation —
+        just a clean exit."""
+        with self.assertRaises(SystemExit) as cm:
+            with redirect_stdout(io.StringIO()):
+                rules_db.cmd_sync(self.con, _Args())
+        msg = str(cm.exception.code)
+        self.assertIn("STANDING_RULES_SYNC_URL", msg)
+        self.assertNotIn("signature", msg.lower(),
+                         "Should not mention signature when env not set")
+        self.assertNotIn("lockdown", msg.lower(),
+                         "Should not mention lockdown when env not set")
+
+    def test_sync_with_signature_payload_no_env_token_fails_clean(self):
+        """Even with a signed payload, if STANDING_RULES_SYNC_TOKEN is not set,
+        the user gets the token error, not a signature verification error."""
+        # Set URL but NOT token
+        rules_db.os.environ["STANDING_RULES_SYNC_URL"] = "http://dash.invalid"
+        rules_db.os.environ.pop("STANDING_RULES_SYNC_TOKEN", None)
+
+        payload = {"rules": [], "signature": "fake-signature", "valid_until": "2030-01-01T00:00:00Z"}
+
+        def fake_urlopen(req, timeout=None):
+            return _FakeResp(json.dumps(payload).encode())
+
+        rules_db.urllib.request.urlopen = fake_urlopen
+
+        with self.assertRaises(SystemExit) as cm:
+            with redirect_stdout(io.StringIO()):
+                rules_db.cmd_sync(self.con, _Args())
+        msg = str(cm.exception.code)
+        self.assertIn("SYNC_TOKEN", msg, "Token error takes precedence over signature check")
+
+    def test_legacy_payload_without_signature_applies_rules(self):
+        """Regression: a sync response without a signature field still applies
+        rules normally (backward compat with pre-enterprise dashboards)."""
+        rules_db.os.environ["STANDING_RULES_SYNC_URL"] = "http://dash.invalid"
+        rules_db.os.environ["STANDING_RULES_SYNC_TOKEN"] = "test-token"
+
+        payload = {"rules": [
+            {"id": "SR-LEGACY", "name": "legacy", "text": "old dashboard",
+             "tier": 2, "domain": "testing", "priority": "MED"}
+        ]}
+        # No signature, no valid_until, no tier1_hash
+
+        def fake_urlopen(req, timeout=None):
+            return _FakeResp(json.dumps(payload).encode())
+
+        rules_db.urllib.request.urlopen = fake_urlopen
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rules_db.cmd_sync(self.con, _Args())
+        result = out.getvalue()
+        self.assertIn("1 org rules applied", result)
+        row = self.con.execute(
+            "SELECT status FROM rules WHERE rule_id='SR-LEGACY'").fetchone()
+        self.assertEqual(row[0], "active")
+
+    def test_expired_valid_until_triggers_lockdown(self):
+        """Enterprise feature: valid_until in the past triggers lockdown
+        message and disables org rules."""
+        rules_db.os.environ["STANDING_RULES_SYNC_URL"] = "http://dash.invalid"
+        rules_db.os.environ["STANDING_RULES_SYNC_TOKEN"] = "test-token"
+        self._seed_local_rule("SR-ORG-EXPIRED", "org rule")
+        # Seed as org-owned
+        self.con.execute(
+            "UPDATE rules SET owner='org' WHERE rule_id='SR-ORG-EXPIRED'")
+        self.con.commit()
+
+        payload = {
+            "rules": [],
+            "valid_until": "2020-01-01T00:00:00+00:00"  # long expired
+        }
+
+        def fake_urlopen(req, timeout=None):
+            return _FakeResp(json.dumps(payload).encode())
+
+        rules_db.urllib.request.urlopen = fake_urlopen
+
+        with self.assertRaises(SystemExit) as cm:
+            with redirect_stdout(io.StringIO()):
+                rules_db.cmd_sync(self.con, _Args())
+        msg = str(cm.exception.code)
+        self.assertIn("COMPLIANCE LOCKDOWN", msg)
+        self.assertIn("re-establish connection", msg)
+        self.assertIn("master rules database", msg)
+        # Verify org rule was disabled
+        row = self.con.execute(
+            "SELECT status FROM rules WHERE rule_id='SR-ORG-EXPIRED'").fetchone()
+        self.assertEqual(row[0], "disabled")
+
+    def test_future_valid_until_does_not_trigger_lockdown(self):
+        """valid_until in the future should NOT trigger lockdown."""
+        rules_db.os.environ["STANDING_RULES_SYNC_URL"] = "http://dash.invalid"
+        rules_db.os.environ["STANDING_RULES_SYNC_TOKEN"] = "test-token"
+        self._seed_local_rule("SR-ORG-FUT", "org rule")
+        self.con.execute(
+            "UPDATE rules SET owner='org' WHERE rule_id='SR-ORG-FUT'")
+        self.con.commit()
+
+        payload = {
+            "rules": [
+                {"id": "SR-ORG-FUT", "name": "org", "text": "org rule",
+                 "tier": 2, "domain": "testing", "priority": "MED"}
+            ],
+            "valid_until": "2030-01-01T00:00:00+00:00"  # far future
+        }
+
+        def fake_urlopen(req, timeout=None):
+            return _FakeResp(json.dumps(payload).encode())
+
+        rules_db.urllib.request.urlopen = fake_urlopen
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rules_db.cmd_sync(self.con, _Args())
+        result = out.getvalue()
+        self.assertIn("1 org rules applied", result)
+        row = self.con.execute(
+            "SELECT status FROM rules WHERE rule_id='SR-ORG-FUT'").fetchone()
+        self.assertEqual(row[0], "active")
+
+    def test_bad_signature_rejects_payload(self):
+        """Enterprise feature: wrong signature triggers integrity failure."""
+        rules_db.os.environ["STANDING_RULES_SYNC_URL"] = "http://dash.invalid"
+        rules_db.os.environ["STANDING_RULES_SYNC_TOKEN"] = "test-token"
+        self._seed_local_rule("SR-ORG-TAMPER", "org rule")
+
+        payload = {
+            "rules": [
+                {"id": "SR-ORG-TAMPER", "name": "tampered", "text": "evil text",
+                 "tier": 2, "domain": "testing", "priority": "MED"}
+            ],
+            "signature": "0000deadbeef"  # wrong signature
+        }
+
+        def fake_urlopen(req, timeout=None):
+            return _FakeResp(json.dumps(payload).encode())
+
+        rules_db.urllib.request.urlopen = fake_urlopen
+
+        with self.assertRaises(SystemExit) as cm:
+            with redirect_stdout(io.StringIO()):
+                rules_db.cmd_sync(self.con, _Args())
+        msg = str(cm.exception.code)
+        self.assertIn("INTEGRITY FAILURE", msg)
+        self.assertIn("signature mismatch", msg)
+        # Rule NOT updated
+        row = self.con.execute(
+            "SELECT text FROM rules WHERE rule_id='SR-ORG-TAMPER'").fetchone()
+        self.assertEqual(row[0], "org rule")
+
+    def test_correct_signature_applies_payload(self):
+        """Enterprise feature: correct HMAC signature allows rules to apply."""
+        import hashlib
+        import hmac as hmac_mod
+
+        rules_db.os.environ["STANDING_RULES_SYNC_URL"] = "http://dash.invalid"
+        rules_db.os.environ["STANDING_RULES_SYNC_TOKEN"] = "test-token"
+
+        rules_payload = [
+            {"id": "SR-ORG-SIGNED", "name": "signed", "text": "signed text",
+             "tier": 2, "domain": "testing", "priority": "MED"}
+        ]
+        rules_json = json.dumps(rules_payload, sort_keys=True)
+        sig = hmac_mod.new(
+            b"test-token", rules_json.encode(), hashlib.sha256).hexdigest()
+
+        payload = {
+            "rules": rules_payload,
+            "signature": sig
+        }
+
+        def fake_urlopen(req, timeout=None):
+            return _FakeResp(json.dumps(payload).encode())
+
+        rules_db.urllib.request.urlopen = fake_urlopen
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rules_db.cmd_sync(self.con, _Args())
+        result = out.getvalue()
+        self.assertIn("1 org rules applied", result)
+        row = self.con.execute(
+            "SELECT text FROM rules WHERE rule_id='SR-ORG-SIGNED'").fetchone()
+        self.assertEqual(row[0], "signed text")
+
+
 if __name__ == "__main__":
     unittest.main()

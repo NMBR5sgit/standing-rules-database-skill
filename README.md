@@ -141,7 +141,7 @@ Design synthesized from: the Hermes skills system (always-injected memory + on-d
 
 The core engine is MIT-licensed and free for everyone, including commercial use.
 As organizations scale their AI agents, they often need centralized management: a shared team database, a web UI for IT to approve rules, and audit logs. A paid enterprise tier for these team-management features is on the roadmap.
-If you are interested in early access or have questions about deploying this across a team, contact me at `98245427+NMBR5sgit@users.noreply.github.com` or [open an issue](https://github.com/NMBR5sgit/standing-rules-database-skill/issues).
+If you are interested in early access or have questions about deploying this across a team, [open an issue](https://github.com/NMBR5sgit/standing-rules-database-skill/issues).
 
 
 *By Lee Weaver.*

@@ -307,10 +307,16 @@ class SyncFetchTest(unittest.TestCase):
 
     def test_sync_missing_token_exits_with_clear_error(self):
         rules_db.os.environ.pop("STANDING_RULES_SYNC_TOKEN", None)
-        with self.assertRaises(SystemExit) as cm:
-            self._sync()
-        self.assertIn("SYNC_URL is set, but SYNC_TOKEN is missing",
-                      str(cm.exception.code))
+        # Vault fallback must be off for this test: sync resolution env-only.
+        rules_db.os.environ["STANDING_RULES_VAULT_PATH"] = \
+            str(pathlib.Path(__file__).parent / "_no_vault_here.py")
+        try:
+            with self.assertRaises(SystemExit) as cm:
+                self._sync()
+            self.assertIn("no token found",
+                          str(cm.exception.code))
+        finally:
+            rules_db.os.environ.pop("STANDING_RULES_VAULT_PATH", None)
 
     def test_sync_401_exits_gracefully_no_stack_trace(self):
         def deny(req, timeout=None):
@@ -464,6 +470,9 @@ class OfflineStandaloneTest(unittest.TestCase):
         # Set URL but NOT token
         rules_db.os.environ["STANDING_RULES_SYNC_URL"] = "http://dash.invalid"
         rules_db.os.environ.pop("STANDING_RULES_SYNC_TOKEN", None)
+        # Vault fallback off for env-only resolution semantics in this test.
+        rules_db.os.environ["STANDING_RULES_VAULT_PATH"] = \
+            str(pathlib.Path(__file__).parent / "_no_vault_here.py")
 
         payload = {"rules": [], "signature": "fake-signature", "valid_until": "2030-01-01T00:00:00Z"}
 

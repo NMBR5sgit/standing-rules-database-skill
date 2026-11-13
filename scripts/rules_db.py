@@ -21,6 +21,8 @@ Commands:
 """
 import argparse, json, re, sqlite3, sys, datetime, pathlib
 import os
+import platform
+import subprocess
 import threading
 import urllib.request
 import urllib.error
@@ -294,7 +296,7 @@ def _fire_sync_webhook(payload: dict, wait: bool = False):
     if not base:
         return
     headers = {"Content-Type": "application/json", "User-Agent": USER_AGENT}
-    token = os.environ.get("STANDING_RULES_SYNC_TOKEN")
+    token = _sync_token()
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
@@ -369,11 +371,53 @@ def _reject_if_org_owned(con, rule_id, action, attempted_by):
         sys.exit(f"ERROR: Cannot modify org-owned rule {rule_id}. Contact IT.")
 
 
-def _source_machine():
+def _machine_id():
+    """Stable machine identity used BOTH as the X-Client-Machine sync header
+    and as source_machine in telemetry events, so the dashboard sees one
+    consistent seat identity (hostname + short hash, no PII)."""
     try:
-        return os.environ.get("COMPUTERNAME") or os.uname().nodename
-    except AttributeError:
-        return "unknown"
+        host = platform.node() or os.environ.get("COMPUTERNAME") or "unknown"
+    except Exception:
+        host = os.environ.get("COMPUTERNAME") or "unknown"
+    return f"{host}-{hashlib.sha256(host.encode()).hexdigest()[:8]}"
+
+
+# Keep the old name: telemetry payloads and tests refer to it.
+def _source_machine():
+    return _machine_id()
+
+
+DEFAULT_VAULT_PATH = pathlib.Path.home() / ".secrets" / "vault.py"
+VAULT_TOKEN_NAME = "standing_rules_sync_token"
+
+
+def _vault_path():
+    """Vault location, overridable via STANDING_RULES_VAULT_PATH (tests and
+    non-standard installs point it elsewhere or at a nonexistent path to
+    disable the vault fallback)."""
+    return pathlib.Path(os.environ.get("STANDING_RULES_VAULT_PATH")
+                        or DEFAULT_VAULT_PATH)
+
+
+def _sync_token():
+    """Resolve the sync token: STANDING_RULES_SYNC_TOKEN env first, then the
+    central secrets vault entry. Keeps the secret out of Windows env when the
+    user wires sync via the vault (vault-first convention)."""
+    token = os.environ.get("STANDING_RULES_SYNC_TOKEN")
+    if token:
+        return token
+    vp = _vault_path()
+    if vp.exists():
+        try:
+            r = subprocess.run(
+                [sys.executable, str(vp), "get", VAULT_TOKEN_NAME],
+                capture_output=True, text=True, timeout=10)
+            v = (r.stdout or "").strip()
+            if r.returncode == 0 and v.startswith("sr_"):
+                return v
+        except Exception:
+            pass  # vault unavailable/offline — sync degrades to env-only
+    return None
 
 
 def _state_blob(row):
@@ -661,9 +705,12 @@ def cmd_sync(con, a):
     url = os.environ.get("STANDING_RULES_SYNC_URL")
     if not url:
         sys.exit("ERROR: STANDING_RULES_SYNC_URL is not set. Sync is disabled.")
-    token = os.environ.get("STANDING_RULES_SYNC_TOKEN")
+    token = _sync_token()
     if not token:
-        sys.exit("ERROR: SYNC_URL is set, but SYNC_TOKEN is missing.")
+        sys.exit("ERROR: SYNC_URL is set but no token found. Set "
+                 "STANDING_RULES_SYNC_TOKEN or store the vault entry "
+                 f"'{VAULT_TOKEN_NAME}' "
+                 f"(python {_vault_path()} set {VAULT_TOKEN_NAME} <token>).")
     fetch_url = _sync_base_url() + "/sync/pull"
     # Optional corporate domain for key-sharing detection (paid tenants only).
     # Normalize: lowercase + strip trailing dot (legal in DNS, but the dashboard
@@ -674,10 +721,9 @@ def cmd_sync(con, a):
         if corporate_domain.endswith('.'):
             corporate_domain = corporate_domain[:-1]
     # Machine ID for seat enforcement: stable across runs on this machine
-    # Uses hostname + user hash as a stable identifier (no PII)
-    import hashlib
-    import platform
-    machine_id = f"{platform.node()}-{hashlib.sha256(platform.node().encode()).hexdigest()[:8]}"
+    # (hostname + short hash, no PII). Same identity as telemetry
+    # source_machine — the dashboard sees one consistent seat.
+    machine_id = _machine_id()
     sync_headers = {"Authorization": f"Bearer {token}",
                     "User-Agent": USER_AGENT,
                     "X-Client-Machine": machine_id}
@@ -841,6 +887,79 @@ def cmd_lockdown(con, a):
               f"(issued {state['issued_at']} by {state['issued_by']}: {state['reason']})")
 
 
+def cmd_keys(con, a):
+    """Scan for existing sync keys and verify which ones authenticate — the
+    'press a button to find my keys' command. Looks in the environment and
+    the central secrets vault, probes every candidate against the dashboard's
+    /sync/pull, and reports tenant attribution. Full tokens are never
+    printed; sync never writes anything."""
+    url = os.environ.get("STANDING_RULES_SYNC_URL")
+    if not url:
+        sys.exit("ERROR: STANDING_RULES_SYNC_URL is not set — nothing to "
+                 "scan against. Wire it with: setx STANDING_RULES_SYNC_URL "
+                 "<dashboard-url>")
+    base = _sync_base_url()
+    cands = []  # (source, token)
+    env_tok = os.environ.get("STANDING_RULES_SYNC_TOKEN")
+    if env_tok:
+        cands.append(("env:STANDING_RULES_SYNC_TOKEN", env_tok))
+    vp = _vault_path()
+    if vp.exists():
+        def _vault(name):
+            r = subprocess.run([sys.executable, str(vp), "get", name],
+                               capture_output=True, text=True, timeout=10)
+            v = (r.stdout or "").strip()
+            return v if r.returncode == 0 and v.startswith("sr_") else None
+        v = _vault(VAULT_TOKEN_NAME)
+        if v and v not in [c[1] for c in cands]:
+            cands.append((f"vault:{VAULT_TOKEN_NAME}", v))
+        try:  # broad vault scan: other rule/sync-named entries that look like keys
+            r = subprocess.run([sys.executable, str(vp), "list"],
+                               capture_output=True, text=True, timeout=10)
+            for line in (r.stdout or "").splitlines():
+                parts = line.strip().split()
+                name = parts[0] if parts else ""
+                if name and name != VAULT_TOKEN_NAME and re.search(r"rule|sync", name, re.I):
+                    v = _vault(name)
+                    if v and v not in [c[1] for c in cands]:
+                        cands.append((f"vault:{name}", v))
+        except Exception:
+            pass
+    if not cands:
+        print("keys: no sync keys found in the environment or the vault.")
+        print("  mint one:  POST /admin/create_tenant (X-Admin-Secret header)")
+        print(f"  store it:  python {_vault_path()} set {VAULT_TOKEN_NAME} <token>")
+        return
+    machine = _machine_id()
+    lines = []
+    for source, tok in cands:
+        masked = f"{tok[:7]}…{tok[-4:]}"
+        try:
+            req = urllib.request.Request(
+                base + "/sync/pull",
+                headers={"Authorization": f"Bearer {tok}",
+                         "User-Agent": USER_AGENT,
+                         "X-Client-Machine": machine})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                body = json.loads(resp.read().decode())
+            tenant = body.get("tenant_name") or body.get("tenant_id") or "?"
+            n = len(body.get("rules") or [])
+            lines.append(f"OK     {masked:<30} {source:<38} tenant={tenant} rules={n}")
+        except urllib.error.HTTPError as e:
+            detail = ""
+            try:
+                detail = (e.read().decode(errors="replace")[:70]).strip()
+            except Exception:
+                pass
+            lines.append(f"REJECT {masked:<30} {source:<38} HTTP {e.code} {detail}")
+        except Exception as e:
+            lines.append(f"ERROR  {masked:<30} {source:<38} {type(e).__name__}: {e}")
+    print(f"keys: {len(cands)} candidate(s) scanned against {base} "
+          f"(machine {machine}):")
+    for line in lines:
+        print("  " + line)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -872,6 +991,7 @@ def main():
     au = sub.add_parser("audit"); au.add_argument("--format", choices=["csv", "json"], default="csv"); au.add_argument("--out")
     sub.add_parser("lockdown")  # read the kill-switch state (PRD §5)
     s = sub.add_parser("sync")  # enterprise dashboard pull (skeleton; Phase 3)
+    k = sub.add_parser("keys")  # scan env+vault for existing sync keys, verify them
     args = p.parse_args()
     con = connect()
     init_db(con)
@@ -888,7 +1008,8 @@ def main():
      "export-index": lambda: cmd_export_index(con),
      "audit": lambda: cmd_audit(con, args),
      "lockdown": lambda: cmd_lockdown(con, args),
-     "sync": lambda: cmd_sync(con, args)}[args.cmd]()
+     "sync": lambda: cmd_sync(con, args),
+     "keys": lambda: cmd_keys(con, args)}[args.cmd]()
 
 
 if __name__ == "__main__":

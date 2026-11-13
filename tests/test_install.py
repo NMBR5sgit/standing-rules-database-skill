@@ -144,12 +144,19 @@ class InstallProvisionerTest(unittest.TestCase):
 
     def test_missing_token_is_clean_failure(self):
         self._sandbox_persist()
+        # Vault fallback off: provisioner contract tests env-only resolution.
+        os.environ["STANDING_RULES_VAULT_PATH"] = \
+            str(pathlib.Path(__file__).parent / "_no_vault_here.py")
+        os.environ.pop("STANDING_RULES_SYNC_TOKEN", None)
         buf = io.StringIO()
-        with redirect_stdout(buf):
-            with self.assertRaises(SystemExit) as cm:
-                install.main(["--sync-url", "http://dashboard.invalid",
-                              "--agent", "cursor"])
-        self.assertIn("SYNC_TOKEN", str(cm.exception))
+        try:
+            with redirect_stdout(buf):
+                with self.assertRaises(SystemExit) as cm:
+                    install.main(["--sync-url", "http://dashboard.invalid",
+                                  "--agent", "cursor"])
+            self.assertIn("SYNC_TOKEN", str(cm.exception))
+        finally:
+            os.environ.pop("STANDING_RULES_VAULT_PATH", None)
 
     def test_agent_autodetect_finds_all_installed(self):
         real_which = install.shutil.which

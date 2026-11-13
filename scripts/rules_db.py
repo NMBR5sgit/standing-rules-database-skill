@@ -887,12 +887,82 @@ def cmd_lockdown(con, a):
               f"(issued {state['issued_at']} by {state['issued_by']}: {state['reason']})")
 
 
+KEY_RE = re.compile(r"sr[-_][a-z]+[-_][A-Za-z0-9_-]{12,}")
+
+
+def _mask(token):
+    return f"{token[:7]}…{token[-4:]}"
+
+
+def _probe_key(base, token, machine):
+    """One authenticated probe of /sync/pull. Returns (ok, detail, body|None)."""
+    try:
+        req = urllib.request.Request(
+            base + "/sync/pull",
+            headers={"Authorization": f"Bearer {token}",
+                     "User-Agent": USER_AGENT,
+                     "X-Client-Machine": machine})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = json.loads(resp.read().decode())
+        tenant = body.get("tenant_name") or body.get("tenant_id") or "?"
+        n = len(body.get("rules") or [])
+        return True, f"tenant={tenant} rules={n}", body
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = (e.read().decode(errors="replace")[:70]).strip()
+        except Exception:
+            pass
+        return False, f"HTTP {e.code} {detail}".strip(), None
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}", None
+
+
+def _delete_key_source(source, token):
+    """Delete exactly ONE key at its source. Never clears the environment and
+    never removes or truncates a file that carries anything besides the key —
+    the file itself is deleted only when the key was its entire content."""
+    kind, _, target = source.partition(":")
+    if kind == "env":
+        os.environ.pop(target, None)
+        if os.name == "nt":
+            subprocess.run(
+                ["reg", "delete", "HKCU\\Environment", "/v", target, "/f"],
+                capture_output=True, text=True)
+        return f"env var {target} deleted — every other variable left intact"
+    if kind == "vault":
+        r = subprocess.run([sys.executable, str(_vault_path()), "del", target],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            raise RuntimeError((r.stderr or r.stdout).strip() or "vault del failed")
+        return f"vault entry '{target}' deleted — other vault entries left intact"
+    if kind == "file":
+        p = pathlib.Path(target).expanduser()
+        text = p.read_text(encoding="utf-8", errors="replace")
+        lines = text.splitlines(keepends=True)
+        kept = [ln for ln in lines if token not in ln]
+        removed = len(lines) - len(kept)
+        if not "".join(kept).strip():
+            p.unlink()
+            return (f"file {p} deleted — it held nothing besides the key "
+                    f"({removed} line(s))")
+        p.write_text("".join(kept), encoding="utf-8")
+        return (f"file {p} edited in place — {removed} key line(s) removed, "
+                f"all other content left intact")
+    raise ValueError(f"unknown key source: {source}")
+
+
 def cmd_keys(con, a):
     """Scan for existing sync keys and verify which ones authenticate — the
-    'press a button to find my keys' command. Looks in the environment and
-    the central secrets vault, probes every candidate against the dashboard's
-    /sync/pull, and reports tenant attribution. Full tokens are never
-    printed; sync never writes anything."""
+    'press a button to find my keys' command. Looks in the environment, the
+    central secrets vault and any file passed with --file, probes each
+    candidate against the dashboard's /sync/pull, and reports tenant
+    attribution. Full tokens are never printed.
+
+    `--delete <source>` removes one verified key at its source (env:VAR |
+    vault:NAME | file:PATH): only that variable / vault entry / key line
+    goes, and a file is deleted only if the key was its only content.
+    Deletion refuses unverified keys unless --force is given."""
     url = os.environ.get("STANDING_RULES_SYNC_URL")
     if not url:
         sys.exit("ERROR: STANDING_RULES_SYNC_URL is not set — nothing to "
@@ -904,7 +974,7 @@ def cmd_keys(con, a):
     if env_tok:
         cands.append(("env:STANDING_RULES_SYNC_TOKEN", env_tok))
     vp = _vault_path()
-    if vp.exists():
+    if vp.exists() and not getattr(a, "no_vault", False):
         def _vault(name):
             r = subprocess.run([sys.executable, str(vp), "get", name],
                                capture_output=True, text=True, timeout=10)
@@ -921,43 +991,63 @@ def cmd_keys(con, a):
                 name = parts[0] if parts else ""
                 if name and name != VAULT_TOKEN_NAME and re.search(r"rule|sync", name, re.I):
                     v = _vault(name)
-                    if v and v not in [c[1] for c in cands]:
+                    if v and (f"vault:{name}", v) not in cands:
                         cands.append((f"vault:{name}", v))
         except Exception:
             pass
+    for fp in (getattr(a, "file", None) or []):  # explicit files (keys usually share files with other data)
+        p = pathlib.Path(fp).expanduser()
+        if not p.is_file():
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        for tok in KEY_RE.findall(text):
+            if (f"file:{p}", tok) not in cands:
+                cands.append((f"file:{p}", tok))
     if not cands:
-        print("keys: no sync keys found in the environment or the vault.")
+        print("keys: no sync keys found in the environment, the vault, or the "
+              "files given.")
         print("  mint one:  POST /admin/create_tenant (X-Admin-Secret header)")
         print(f"  store it:  python {_vault_path()} set {VAULT_TOKEN_NAME} <token>")
         return
     machine = _machine_id()
+
+    dele = getattr(a, "delete", None)
+    if dele:
+        match = [c for c in cands if c[0] == dele]
+        if not match:
+            sys.exit(f"keys: no candidate with source '{dele}'. Available: "
+                     + ", ".join(src for src, _ in cands))
+        source, tok = match[0]
+        ok, detail, _ = _probe_key(base, tok, machine)
+        if not ok and not getattr(a, "force", False):
+            sys.exit(f"keys: refusing to delete an unverified key from "
+                     f"{source} ({detail}). Verify it first, or pass --force.")
+        try:
+            msg = _delete_key_source(source, tok)
+        except Exception as e:
+            sys.exit(f"keys: delete failed for {source}: {e}")
+        print(f"keys: {_mask(tok)} — {msg}")
+        still_ok, still_detail, _ = _probe_key(base, tok, machine)
+        if still_ok:
+            print("keys: note — the dashboard still authenticates this token. "
+                  "Deleting the local copy does not revoke it; rotate or "
+                  "revoke it server-side to invalidate it.")
+        return
+
     lines = []
     for source, tok in cands:
-        masked = f"{tok[:7]}…{tok[-4:]}"
-        try:
-            req = urllib.request.Request(
-                base + "/sync/pull",
-                headers={"Authorization": f"Bearer {tok}",
-                         "User-Agent": USER_AGENT,
-                         "X-Client-Machine": machine})
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                body = json.loads(resp.read().decode())
-            tenant = body.get("tenant_name") or body.get("tenant_id") or "?"
-            n = len(body.get("rules") or [])
-            lines.append(f"OK     {masked:<30} {source:<38} tenant={tenant} rules={n}")
-        except urllib.error.HTTPError as e:
-            detail = ""
-            try:
-                detail = (e.read().decode(errors="replace")[:70]).strip()
-            except Exception:
-                pass
-            lines.append(f"REJECT {masked:<30} {source:<38} HTTP {e.code} {detail}")
-        except Exception as e:
-            lines.append(f"ERROR  {masked:<30} {source:<38} {type(e).__name__}: {e}")
+        ok, detail, _ = _probe_key(base, tok, machine)
+        tag = "OK     " if ok else "REJECT "
+        lines.append(f"{tag} {_mask(tok):<30} {source:<38} {detail}")
     print(f"keys: {len(cands)} candidate(s) scanned against {base} "
           f"(machine {machine}):")
     for line in lines:
         print("  " + line)
+    print("  delete one after verifying it: rules_db.py keys --delete <source>"
+          "   (only that variable / vault entry / key line is removed)")
 
 
 def main():
@@ -991,7 +1081,16 @@ def main():
     au = sub.add_parser("audit"); au.add_argument("--format", choices=["csv", "json"], default="csv"); au.add_argument("--out")
     sub.add_parser("lockdown")  # read the kill-switch state (PRD §5)
     s = sub.add_parser("sync")  # enterprise dashboard pull (skeleton; Phase 3)
-    k = sub.add_parser("keys")  # scan env+vault for existing sync keys, verify them
+    k = sub.add_parser("keys")  # scan env+vault+files for sync keys, verify them
+    k.add_argument("--file", action="append", default=[],
+                   help="additional file(s) to scan for key strings")
+    k.add_argument("--delete", metavar="SOURCE",
+                   help="delete this verified key at its source "
+                        "(env:VAR | vault:NAME | file:PATH)")
+    k.add_argument("--force", action="store_true",
+                   help="delete even if the key does not authenticate")
+    k.add_argument("--no-vault", action="store_true",
+                   help="skip the vault scan (env and --file only)")
     args = p.parse_args()
     con = connect()
     init_db(con)

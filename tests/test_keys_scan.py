@@ -322,6 +322,30 @@ class KeysDeleteTest(unittest.TestCase):
         self.assertNotIn("standing_rules_sync_token", store)
         self.assertEqual(store.get("some_other_secret"), "keepme-value")
 
+    def test_a_revoked_tenants_key_is_reported_revoked_not_ok(self):
+        tok = "sr_live_" + "r" * 32
+        cfg = pathlib.Path(self.tmp.name) / "config.txt"
+        cfg.write_text("MISC=1\nKEY=" + tok + "\n", encoding="utf-8")
+
+        def handler(req, timeout=None):
+            return _FakeResp(json.dumps({"status": "revoked",
+                                         "action": "wipe_org_rules",
+                                         "tenant_name": "key-scan-live-test"}).encode())
+        rules_db.urllib.request.urlopen = handler
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rules_db.cmd_keys(self.con, _Args(file=[str(cfg)]))
+        out = buf.getvalue()
+        self.assertIn("REVOKED", out)          # not mistaken for a live key
+        self.assertNotIn("OK     ", out)
+        # a revoked key is still deletable from where it was found
+        with redirect_stdout(io.StringIO()):
+            rules_db.cmd_keys(self.con, _Args(
+                file=[str(cfg)], delete=f"file:{cfg}"))
+        text = cfg.read_text()
+        self.assertNotIn(tok, text)
+        self.assertIn("MISC=1", text)
+
     def test_delete_names_an_unknown_source_cleanly(self):
         os.environ["STANDING_RULES_SYNC_TOKEN"] = "sr_live_" + "n" * 32
         self._accept(set())

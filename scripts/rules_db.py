@@ -905,6 +905,10 @@ def _probe_key(base, token, machine):
         with urllib.request.urlopen(req, timeout=15) as resp:
             body = json.loads(resp.read().decode())
         tenant = body.get("tenant_name") or body.get("tenant_id") or "?"
+        if body.get("status") == "revoked":   # tenant suspended/cancelled: the
+            # key still authenticates but no longer syncs anything
+            action = body.get("action") or "revoked"
+            return True, f"REVOKED tenant={tenant} action={action}", body
         n = len(body.get("rules") or [])
         return True, f"tenant={tenant} rules={n}", body
     except urllib.error.HTTPError as e:
@@ -1031,7 +1035,10 @@ def cmd_keys(con, a):
             sys.exit(f"keys: delete failed for {source}: {e}")
         print(f"keys: {_mask(tok)} — {msg}")
         still_ok, still_detail, _ = _probe_key(base, tok, machine)
-        if still_ok:
+        if still_detail.startswith("REVOKED"):
+            print("keys: note — that tenant is revoked: the key still "
+                  "authenticates but no longer syncs any rules.")
+        elif still_ok:
             print("keys: note — the dashboard still authenticates this token. "
                   "Deleting the local copy does not revoke it; rotate or "
                   "revoke it server-side to invalidate it.")
@@ -1040,7 +1047,10 @@ def cmd_keys(con, a):
     lines = []
     for source, tok in cands:
         ok, detail, _ = _probe_key(base, tok, machine)
-        tag = "OK     " if ok else "REJECT "
+        if detail.startswith("REVOKED"):      # key works, tenant does not
+            tag, detail = "REVOKED", detail[len("REVOKED "):]
+        else:
+            tag = "OK     " if ok else "REJECT "
         lines.append(f"{tag} {_mask(tok):<30} {source:<38} {detail}")
     print(f"keys: {len(cands)} candidate(s) scanned against {base} "
           f"(machine {machine}):")

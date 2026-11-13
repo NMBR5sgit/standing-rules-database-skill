@@ -956,23 +956,10 @@ def _delete_key_source(source, token):
     raise ValueError(f"unknown key source: {source}")
 
 
-def cmd_keys(con, a):
-    """Scan for existing sync keys and verify which ones authenticate — the
-    'press a button to find my keys' command. Looks in the environment, the
-    central secrets vault and any file passed with --file, probes each
-    candidate against the dashboard's /sync/pull, and reports tenant
-    attribution. Full tokens are never printed.
-
-    `--delete <source>` removes one verified key at its source (env:VAR |
-    vault:NAME | file:PATH): only that variable / vault entry / key line
-    goes, and a file is deleted only if the key was its only content.
-    Deletion refuses unverified keys unless --force is given."""
-    url = os.environ.get("STANDING_RULES_SYNC_URL")
-    if not url:
-        sys.exit("ERROR: STANDING_RULES_SYNC_URL is not set — nothing to "
-                 "scan against. Wire it with: setx STANDING_RULES_SYNC_URL "
-                 "<dashboard-url>")
-    base = _sync_base_url()
+def _key_candidates(a):
+    """Every place a sync key could be hiding on this machine: the
+    environment, the central secrets vault, and any file named with --file
+    (keys almost always share a file with other settings)."""
     cands = []  # (source, token)
     env_tok = os.environ.get("STANDING_RULES_SYNC_TOKEN")
     if env_tok:
@@ -1010,13 +997,102 @@ def cmd_keys(con, a):
         for tok in KEY_RE.findall(text):
             if (f"file:{p}", tok) not in cands:
                 cands.append((f"file:{p}", tok))
+    return cands
+
+
+def _keys_api(base, path, token, machine, payload=None):
+    """GET (payload None) or POST JSON against a dashboard /keys endpoint.
+    Raises RuntimeError carrying the server's own detail on any non-2xx."""
+    data = None if payload is None else json.dumps(payload).encode()
+    headers = {"Authorization": f"Bearer {token}", "User-Agent": USER_AGENT,
+               "X-Client-Machine": machine}
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(base + path, data=data, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read().decode()
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = str(json.loads(e.read().decode()).get("detail") or "")
+        except Exception:
+            pass
+        raise RuntimeError(f"HTTP {e.code} {detail}".strip()) from e
+    except Exception as e:
+        raise RuntimeError(f"{type(e).__name__}: {e}") from e
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
+def _apply_queued_deletes(base, cands, machine):
+    """Carry out the deletes the dashboard's Keys page queued for THIS
+    machine. Matching is by source + masked key — the dashboard never sees
+    the full key — so a queued delete can only remove the exact local copy
+    the admin was shown."""
+    token = _sync_token()
+    try:
+        pending = _keys_api(base, "/keys/pending", token, machine).get("pending") or []
+    except RuntimeError as e:
+        sys.exit(f"keys: could not fetch the queued deletes from {base}: {e}")
+    if not pending:
+        print("keys: no deletes queued for this machine.")
+        return
+    print(f"keys: {len(pending)} delete(s) queued for {machine}:")
+    results = []
+    for item in pending:
+        source, masked = str(item.get("source") or ""), str(item.get("masked") or "")
+        match = [c for c in cands if c[0] == source and _mask(c[1]) == masked]
+        if not match:
+            print(f"  SKIP  {masked:<30} {source:<38} no longer on this machine")
+            results.append({"id": item.get("id"), "status": "not_found"})
+            continue
+        tok = match[0][1]
+        try:
+            msg = _delete_key_source(source, tok)
+            print(f"  DONE  {_mask(tok):<30} {source:<38} {msg}")
+            results.append({"id": item.get("id"), "status": "deleted"})
+        except Exception as e:
+            print(f"  FAIL  {_mask(tok):<30} {source:<38} {e}")
+            results.append({"id": item.get("id"), "status": f"failed: {e}"})
+    try:
+        _keys_api(base, "/keys/ack", token, machine,
+                  {"machine": machine, "results": results})
+    except RuntimeError as e:
+        print(f"keys: could not report the results to {base}: {e}")
+    removed = sum(1 for r in results if r["status"] == "deleted")
+    print(f"keys: {removed} of {len(results)} queued key(s) removed from this "
+          f"machine. The dashboard's own key is untouched — revoke or rotate "
+          f"it there to invalidate it server-side.")
+
+
+def cmd_keys(con, a):
+    """Scan for existing sync keys, verify which ones authenticate, report
+    them to the dashboard, or delete one at its source.
+
+    Plain `keys` (or --report) prints masked candidates with tenant
+    attribution; --delete <source> surgically removes one verified key;
+    --apply carries out the deletes the dashboard's Keys page queued for
+    this machine. Full tokens are never printed or uploaded."""
+    url = os.environ.get("STANDING_RULES_SYNC_URL")
+    if not url:
+        sys.exit("ERROR: STANDING_RULES_SYNC_URL is not set — nothing to "
+                 "scan against. Wire it with: setx STANDING_RULES_SYNC_URL "
+                 "<dashboard-url>")
+    base = _sync_base_url()
+    cands = _key_candidates(a)
     if not cands:
         print("keys: no sync keys found in the environment, the vault, or the "
-              "files given.")
+              "files given (nothing reported).")
         print("  mint one:  POST /admin/create_tenant (X-Admin-Secret header)")
         print(f"  store it:  python {_vault_path()} set {VAULT_TOKEN_NAME} <token>")
         return
     machine = _machine_id()
+
+    if getattr(a, "apply", False):
+        return _apply_queued_deletes(base, cands, machine)
 
     dele = getattr(a, "delete", None)
     if dele:
@@ -1044,20 +1120,61 @@ def cmd_keys(con, a):
                   "revoke it server-side to invalidate it.")
         return
 
-    lines = []
+    verdicts = []
     for source, tok in cands:
         ok, detail, _ = _probe_key(base, tok, machine)
         if detail.startswith("REVOKED"):      # key works, tenant does not
-            tag, detail = "REVOKED", detail[len("REVOKED "):]
+            verdict = "revoked"
+            detail = detail[len("REVOKED "):]
         else:
-            tag = "OK     " if ok else "REJECT "
-        lines.append(f"{tag} {_mask(tok):<30} {source:<38} {detail}")
-    print(f"keys: {len(cands)} candidate(s) scanned against {base} "
+            verdict = "ok" if ok else "reject"
+        rules = None
+        rules_m = re.search(r"rules=(\d+)", detail)
+        if rules_m:
+            rules = int(rules_m.group(1))
+        verdicts.append({"source": source, "token": tok, "masked": _mask(tok),
+                         "verdict": verdict, "detail": detail, "rules": rules})
+    if getattr(a, "json_mode", False):     # machine-readable for the scanner window
+        print(json.dumps({"machine": machine, "base": base,
+                          "candidates": [{"source": v["source"], "masked": v["masked"],
+                                          "verdict": v["verdict"], "rules": v["rules"],
+                                          "tenant": (re.search(r"tenant=(\S+)", v["detail"])
+                                                     or [None, "?"])[1]}
+                                         for v in verdicts]}))
+        return
+
+    tag_of = {"ok": "OK     ", "revoked": "REVOKED", "reject": "REJECT "}
+    print(f"keys: {len(verdicts)} candidate(s) scanned against {base} "
           f"(machine {machine}):")
-    for line in lines:
-        print("  " + line)
-    print("  delete one after verifying it: rules_db.py keys --delete <source>"
-          "   (only that variable / vault entry / key line is removed)")
+    for v in verdicts:
+        print(f"  {tag_of[v['verdict']]} {v['masked']:<30} "
+              f"{v['source']:<38} {v['detail']}")
+
+    if getattr(a, "report", False):
+        # a scan that only looked at --file / skipped the vault must not be
+        # read as 'this key is gone' by the dashboard
+        scope = ("partial" if (getattr(a, "file", None)
+                               or getattr(a, "no_vault", False)) else "full")
+        # only keys that belong to a tenant are sightings; a string that
+        # merely looks like a key and authenticates nowhere is noise
+        payload = {"machine": machine, "scope": scope,
+                   "candidates": [{"source": v["source"], "masked": v["masked"],
+                                   "verdict": v["verdict"], "rules": v["rules"]}
+                                  for v in verdicts if v["verdict"] != "reject"]}
+        try:
+            body = _keys_api(base, "/keys/report",
+                             _sync_token(), machine, payload)
+            print(f"keys: reported {body.get('keys', 0)} masked sighting(s) to "
+                  f"{base}/keys/report (scope {body.get('scope', scope)}). The "
+                  f"full key never left this machine.")
+        except RuntimeError as e:
+            sys.exit(f"keys: report failed: {e}")
+    else:
+        print("  delete one after verifying it: rules_db.py keys --delete "
+              "<source>   (only that variable / vault entry / key line is "
+              "removed)")
+        print("  or let the dashboard queue the deletes: keys --report, then "
+              "keys --apply")
 
 
 def main():
@@ -1101,6 +1218,13 @@ def main():
                    help="delete even if the key does not authenticate")
     k.add_argument("--no-vault", action="store_true",
                    help="skip the vault scan (env and --file only)")
+    k.add_argument("--json", action="store_true", dest="json_mode",
+                   help="print the masked scan as JSON (used by the scanner window)")
+    k.add_argument("--report", action="store_true",
+                   help="upload the masked findings to the dashboard Keys page "
+                        "(the full key is never sent)")
+    k.add_argument("--apply", action="store_true",
+                   help="execute the deletes the Keys page queued for this machine")
     args = p.parse_args()
     con = connect()
     init_db(con)

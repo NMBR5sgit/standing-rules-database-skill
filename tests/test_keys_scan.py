@@ -356,5 +356,212 @@ class KeysDeleteTest(unittest.TestCase):
         self.assertIn("no candidate with source", str(cm.exception))
 
 
+class FakeDash:
+    """Minimal stand-in dashboard for the keys endpoints: /sync/pull,
+    /keys/report, /keys/pending, /keys/ack."""
+
+    def __init__(self, tokens, pending=()):
+        self.tokens = set(tokens)
+        self.pending = list(pending)
+        self.reports = []          # (token, payload) actually uploaded
+        self.acks = []             # payloads the machine acked
+        self.pending_for = []      # machine ids that were served a queue
+        self.calls = []
+
+    def handler(self, req, timeout=None):
+        import urllib.parse
+        path = urllib.parse.urlparse(req.full_url).path
+        hdrs = {k.lower(): v for k, v in (req.headers or {}).items()}
+        tok = (hdrs.get("authorization") or "").replace("Bearer ", "")
+        self.calls.append((path, tok))
+        body = json.loads(req.data.decode()) if req.data else {}
+
+        def deny(code=401):
+            raise urllib.error.HTTPError(req.full_url, code, "Denied", {}, None)
+
+        if path == "/sync/pull":
+            if tok not in self.tokens:
+                deny()
+            return _FakeResp(json.dumps({"rules": [],
+                                         "tenant_name": "lee-weaver-personal",
+                                         "valid_until": "2030-01-01T00:00:00Z"}).encode())
+        if path == "/keys/report":
+            if tok not in self.tokens:
+                deny()
+            self.reports.append((tok, body))
+            return _FakeResp(json.dumps({"status": "ok", "keys": len(
+                body.get("candidates") or []), "scope": body.get("scope")}).encode())
+        if path == "/keys/pending":
+            if tok not in self.tokens:
+                deny()
+            self.pending_for.append(hdrs.get("x-client-machine"))
+            return _FakeResp(json.dumps({"pending": self.pending}).encode())
+        if path == "/keys/ack":
+            if tok not in self.tokens:
+                deny()
+            self.acks.append(body)
+            return _FakeResp(json.dumps({"status": "ok", "results": len(
+                body.get("results") or [])}).encode())
+        deny(404)
+
+
+class KeysReportApplyTest(unittest.TestCase):
+    """`keys --report` uploads masked sightings; `keys --apply` carries out
+    the deletes the dashboard queued, and only those it can match."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._env = dict(os.environ)
+        os.environ["STANDING_RULES_SYNC_URL"] = "http://dash.invalid"
+        os.environ["STANDING_RULES_SYNC_TOKEN"] = "sr_live_" + "a" * 32
+        vault = pathlib.Path(self.tmp.name) / "vault.py"
+        vault.write_text(FAKE_VAULT_SRC, encoding="utf-8")
+        os.environ["STANDING_RULES_VAULT_PATH"] = str(vault)
+        self.dash_token = os.environ["STANDING_RULES_SYNC_TOKEN"]
+        self._real_urlopen = rules_db.urllib.request.urlopen
+        self._db_path = rules_db.DB_PATH
+        rules_db.DB_PATH = pathlib.Path(self.tmp.name) / "rules.db"
+        self.con = rules_db.connect()
+        rules_db.init_db(self.con)
+
+    def tearDown(self):
+        self.con.close()
+        rules_db.DB_PATH = self._db_path
+        os.environ.clear()
+        os.environ.update(self._env)
+        rules_db.urllib.request.urlopen = self._real_urlopen
+        self.tmp.cleanup()
+
+    def _install(self, dash):
+        rules_db.urllib.request.urlopen = dash.handler
+
+    def _config_with(self, token):
+        cfg = pathlib.Path(self.tmp.name) / "config.txt"
+        cfg.write_text("# machine settings\nAPI_URL=https://example.test\n"
+                       "TOKEN=" + token + "\nREGION=us\n", encoding="utf-8")
+        return cfg
+
+    def test_report_uploads_masked_sightings_and_never_the_full_key(self):
+        tok = "sr_live_" + "b" * 32
+        cfg = self._config_with(tok)
+        dash = FakeDash({self.dash_token, tok})
+        self._install(dash)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rules_db.cmd_keys(self.con, _Args(file=[str(cfg)], report=True))
+        self.assertIn("masked sighting", buf.getvalue())
+        assert len(dash.reports) == 1
+        _token_used, payload = dash.reports[0]
+        cands = payload["candidates"]
+        self.assertEqual(len(cands), 2)       # env + the file
+        by_source = {c["source"]: c for c in cands}
+        file_cand = by_source[f"file:{cfg}"]
+        self.assertEqual(file_cand["verdict"], "ok")
+        self.assertEqual(file_cand["rules"], 0)
+        self.assertIn("…", file_cand["masked"])
+        # the privacy promise: no full key anywhere in the upload
+        self.assertNotIn(tok, json.dumps(payload))
+        self.assertNotIn(self.dash_token, json.dumps(payload))
+
+    def test_report_labels_a_limited_scan_as_partial_so_absence_is_not_gone(self):
+        dash = FakeDash({self.dash_token})
+        self._install(dash)
+        with redirect_stdout(io.StringIO()):
+            rules_db.cmd_keys(self.con, _Args(report=True))
+        self.assertEqual(dash.reports[0][1]["scope"], "full")
+        cfg = self._config_with("sr_live_" + "c" * 32)
+        with redirect_stdout(io.StringIO()):
+            rules_db.cmd_keys(self.con, _Args(file=[str(cfg)], report=True))
+        self.assertEqual(dash.reports[1][1]["scope"], "partial")
+        with redirect_stdout(io.StringIO()):
+            rules_db.cmd_keys(self.con, _Args(no_vault=True, report=True))
+        self.assertEqual(dash.reports[2][1]["scope"], "partial")
+
+    def test_apply_deletes_exactly_the_queued_key_and_acks_it(self):
+        tok = "sr_live_" + "d" * 32
+        cfg = self._config_with(tok)
+        dash = FakeDash({self.dash_token, tok},
+                        pending=[{"id": 7, "source": f"file:{cfg}",
+                                  "masked": rules_db._mask(tok)}])
+        self._install(dash)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rules_db.cmd_keys(self.con, _Args(file=[str(cfg)], apply=True))
+        text = cfg.read_text()
+        self.assertNotIn(tok, text)
+        self.assertIn("API_URL=https://example.test", text)   # neighbours survive
+        self.assertIn("REGION=us", text)
+        self.assertEqual(dash.acks[0]["results"], [{"id": 7, "status": "deleted"}])
+        self.assertIn("1 of 1 queued", buf.getvalue())
+
+    def test_apply_only_removes_keys_the_dashboard_actually_saw(self):
+        mine = "sr_live_" + "e" * 32
+        cfg = self._config_with(mine)
+        dash = FakeDash({self.dash_token}, pending=[
+            {"id": 8, "source": f"file:{cfg}",
+             "masked": rules_db._mask("sr_live_" + "f" * 32)},   # different key
+            {"id": 9, "source": "env:GONE_TOKEN",
+             "masked": rules_db._mask(mine)},                    # wrong source
+        ])
+        self._install(dash)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rules_db.cmd_keys(self.con, _Args(file=[str(cfg)], apply=True))
+        self.assertIn(mine, cfg.read_text())      # nothing was deleted
+        statuses = {r["id"]: r["status"] for r in dash.acks[0]["results"]}
+        self.assertEqual(statuses, {8: "not_found", 9: "not_found"})
+
+    def test_apply_with_an_empty_queue_touches_nothing(self):
+        tok = "sr_live_" + "g" * 32
+        cfg = self._config_with(tok)
+        dash = FakeDash({self.dash_token, tok}, pending=[])
+        self._install(dash)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rules_db.cmd_keys(self.con, _Args(file=[str(cfg)], apply=True))
+        self.assertIn("no deletes queued", buf.getvalue())
+        self.assertIn(tok, cfg.read_text())
+        self.assertEqual(dash.acks, [])
+
+    def test_a_string_that_authenticates_nowhere_is_not_uploaded_as_a_sighting(self):
+        tok = "sr_live_" + "h" * 32
+        cfg = self._config_with(tok)
+        dash = FakeDash({self.dash_token})      # the file key is unknown to it
+        self._install(dash)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rules_db.cmd_keys(self.con, _Args(file=[str(cfg)], report=True))
+        self.assertIn("REJECT", buf.getvalue())               # shown locally...
+        sources = [c["source"] for c in dash.reports[0][1]["candidates"]]
+        self.assertNotIn(f"file:{cfg}", sources)             # ...but not reported
+        self.assertIn("env:STANDING_RULES_SYNC_TOKEN", sources)
+
+    def test_json_scan_is_machine_readable_and_still_masked(self):
+        tok = "sr_live_" + "j" * 32
+        cfg = self._config_with(tok)
+        dash = FakeDash({self.dash_token, tok})
+        self._install(dash)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rules_db.cmd_keys(self.con, _Args(file=[str(cfg)], json_mode=True))
+        data = json.loads(buf.getvalue())      # stdout is pure JSON
+        self.assertEqual(data["machine"], rules_db._machine_id())
+        by_source = {c["source"]: c for c in data["candidates"]}
+        self.assertEqual(by_source[f"file:{cfg}"]["verdict"], "ok")
+        self.assertEqual(by_source[f"file:{cfg}"]["tenant"], "lee-weaver-personal")
+        self.assertNotIn(tok, buf.getvalue())   # masked, even in JSON
+        self.assertEqual(dash.reports, [])      # --json does not imply --report
+
+    def test_report_reports_failure_with_the_servers_own_reason(self):
+        os.environ["STANDING_RULES_SYNC_TOKEN"] = "sr_live_" + "i" * 32  # unknown
+        dash = FakeDash(set())
+        self._install(dash)
+        with self.assertRaises(SystemExit) as cm:
+            with redirect_stdout(io.StringIO()):
+                rules_db.cmd_keys(self.con, _Args(report=True))
+        self.assertIn("report failed", str(cm.exception))
+        self.assertEqual(dash.reports, [])
+
+
 if __name__ == "__main__":
     unittest.main()

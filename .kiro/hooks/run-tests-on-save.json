@@ -1,0 +1,17 @@
+{
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "rules-db-test-gate",
+      "description": "Run the standing-rules test suite after the agent modifies any Python file",
+      "trigger": "PostFileSave",
+      "matcher": "\\.py$",
+      "action": {
+        "type": "command",
+        "command": "\"C:/Users/User/AppData/Local/hermes/tools/python-3.14.7+20260901-win32-x64/python.exe\" -m pytest tests -q --no-header"
+      },
+      "timeout": 60,
+      "enabled": true
+    }
+  ]
+}

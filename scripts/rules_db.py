@@ -550,7 +550,34 @@ def cmd_status(con, a):
     _fire_sync_webhook(_write_event("rule_status_changed", a.id, con))
 
 
+HOOK_HEARTBEATS = [
+    pathlib.Path(os.environ.get("HERMES_HOME")
+                 or (pathlib.Path(os.environ.get("LOCALAPPDATA") or "~").expanduser() / "hermes"))
+    / "agent-hooks" / "standing_rules_hook.heartbeat",
+    pathlib.Path("~/.claude/hooks/standing_rules_hook.heartbeat").expanduser(),
+]
+HOOK_STALE_SECONDS = 36 * 3600
+
+
+def _warn_if_autoinject_down():
+    """Layer 3 of hook fault visibility: the hook scripts self-report their own
+    errors, but a dead/unregistered hook never runs at all. Its heartbeat file
+    then goes stale. Warn on stderr from every CLI consult (stderr stays out of
+    --json stdout) so a silent hook death is impossible to miss in practice."""
+    import time as _time
+    for hb in HOOK_HEARTBEATS:
+        try:
+            if _time.time() - hb.stat().st_mtime < HOOK_STALE_SECONDS:
+                return
+        except OSError:
+            continue
+    print("!! WARNING: standing-rules auto-consult hook heartbeat missing or >36h stale"
+          " -- tier-2 auto-injection may be DOWN. Diagnose: `hermes hooks doctor`;"
+          " logs: agent-hooks/standing_rules_hook.log", file=sys.stderr)
+
+
 def cmd_query(con, a):
+    _warn_if_autoinject_down()
     rows = query_rules(con, a.match)
     _record_query_telemetry(con, a.match, rows)
     t1 = [r for r in rows if r["tier"] == 1]

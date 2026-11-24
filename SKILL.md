@@ -28,6 +28,7 @@ The skill ships with **no rules** — an empty database. Your rules enter your s
 1. `python scripts/rules_db.py init` — creates the empty schema.
 2. Import YOUR existing rules: `python scripts/scan_candidates.py <memory files / CLAUDE.md / AGENTS.md / notes dir>` — scans your system's rule-like lines and writes `rule_candidates.json`. Candidates are PROPOSALS only: the user reviews/edits the JSON, then activates via `seed`/`add`. Nothing auto-activates (write-gate principle: no auto-promotion).
 3. Tier-1: the user promotes their own few mandatory rules to tier 1 and mirrors them into their agent's always-injected memory too (identity, contact, format rules must not depend on a query).
+4. Auto-consult hook (strongly recommended — tier-2 delivery depends on it): have the agent follow `HOOK-CONTRACT.md` to write the per-turn hook for YOUR agent framework (trigger name, payload shape, context channel, consent gate all differ per framework), then run the verification checklist in that file. The hook script is site-local by design and never shipped.
 
 The seed file (`templates/seed.example.json`) is an intentionally EMPTY file showing only the shape — the content always comes from the user's own system.
 

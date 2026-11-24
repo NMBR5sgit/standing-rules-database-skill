@@ -109,7 +109,7 @@ python scripts/rules_db.py query --match "<your task domain> <your output type>"
 python scripts/rules_db.py export-md
 ```
 
-Copy `SKILL.md` into your agent's skills directory (Hermes, Claude Code skills, or any agent that loads instruction files on demand), keep `templates/seed.example.json` as your starting shape, and mirror your tier-1 rules into your agent's always-injected memory.
+Copy `SKILL.md` into your agent's skills directory (Hermes, Claude Code skills, or any agent that loads instruction files on demand), keep `templates/seed.example.json` as your starting shape, and mirror your tier-1 rules into your agent's always-injected memory. Then have your agent follow `HOOK-CONTRACT.md` to install the per-turn auto-consult hook — optional, but it is what makes tier-2 rules load themselves instead of waiting for the model to remember.
 
 Or install it as a skill directly:
 
@@ -119,7 +119,7 @@ npx skills add NMBR5sgit/standing-rules-database-skill
 
 ## Using without Hermes
 
-The core engine (`scripts/rules_db.py`) is standard-library Python and works with any agent that can run shell commands. The two-tier method — tier-1 mirrored into always-injected memory plus a SKILL.md dispatch index, queried before each task — is agent-agnostic. The Hermes auto-consult hook (`standing_rules_consult.py`) is optional and Hermes-specific; on other agents you follow the SKILL.md "consult before task" instruction manually, with identical `query_rules` semantics. Note that `SKILL.md` frontmatter uses a `hermes:` metadata key, so porting to Claude Code means adapting the frontmatter wrapper only — the mechanism is unchanged.
+The core engine (`scripts/rules_db.py`) is standard-library Python and works with any agent that can run shell commands. The two-tier method — tier-1 mirrored into always-injected memory plus a SKILL.md dispatch index, queried before each task — is agent-agnostic. Auto-consult (per-turn rule injection) is also agent-agnostic: `HOOK-CONTRACT.md` defines the framework-neutral contract — trigger, payload, context channel, three-layer fault visibility, consent gate — and your agent writes the hook in whatever dialect your framework speaks. Frameworks with no hook trigger at all fall back to the manual SKILL.md "consult before task" instruction, with identical `query_rules` semantics. Note that `SKILL.md` frontmatter uses a `hermes:` metadata key, so porting to Claude Code means adapting the frontmatter wrapper only — the mechanism is unchanged.
 
 ### Agent Compatibility
 
